@@ -1,11 +1,14 @@
 import { boundsOf, distanceToBox, unionBoxes, type Box, type Point } from '@/lib/geometry'
-import type { ComponentKind, Match, Stroke } from '@/recognize/types'
+import type { ComponentKind, Match, Ranked, Stroke } from '@/recognize/types'
 
 export interface Placed {
   id: string
   kind: ComponentKind
   box: Box
   label?: string
+  confidence: number
+  /** Other likely components, best first, for the switcher. */
+  alternatives: Ranked[]
   /** The sketch it replaced, so undo can bring it back. */
   strokes: Stroke[]
 }
@@ -24,6 +27,7 @@ export type CanvasAction =
   | { type: 'addStroke'; stroke: Stroke }
   | { type: 'closeGroup' }
   | { type: 'swap'; id: string; strokeIds: string[]; match: Match }
+  | { type: 'reassign'; id: string; kind: ComponentKind }
   | { type: 'undo' }
   | { type: 'clear' }
 
@@ -53,12 +57,39 @@ export function canvasReducer(state: CanvasState, action: CanvasAction): CanvasS
         pending: state.pending.filter((id) => !ids.has(id)),
         placed: [
           ...state.placed,
-          { id: action.id, kind: action.match.kind, box: action.match.box, label: action.match.label, strokes: replaced },
+          {
+            id: action.id,
+            kind: action.match.kind,
+            box: action.match.box,
+            label: action.match.label,
+            confidence: action.match.confidence,
+            alternatives: action.match.alternatives ?? [],
+            strokes: replaced,
+          },
         ],
         history: [
           ...state.history.filter((h) => !(h.type === 'stroke' && ids.has(h.id))),
           { type: 'swap', placedId: action.id },
         ],
+      }
+    }
+
+    case 'reassign': {
+      // Swap a placed component for one of its alternatives; the old pick
+      // joins the alternatives so the user can switch back.
+      return {
+        ...state,
+        placed: state.placed.map((p) => {
+          if (p.id !== action.id || p.kind === action.kind) return p
+          const chosen = p.alternatives.find((a) => a.kind === action.kind)
+          const rest = p.alternatives.filter((a) => a.kind !== action.kind)
+          return {
+            ...p,
+            kind: action.kind,
+            confidence: chosen?.p ?? p.confidence,
+            alternatives: [{ kind: p.kind, p: p.confidence }, ...rest].sort((a, b) => b.p - a.p),
+          }
+        }),
       }
     }
 

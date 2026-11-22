@@ -61,3 +61,25 @@ describe('canvas state', () => {
     expect(startsNewGroup([], { x: 400, y: 300 })).toBe(false)
   })
 })
+
+describe('switching a placed component', () => {
+  it('swaps to an alternative and keeps the old pick as an option', () => {
+    const a = boxStroke(0, 0, 140, 44)
+    const s = run([
+      { type: 'addStroke', stroke: a },
+      {
+        type: 'swap',
+        id: 'p1',
+        strokeIds: [a.id],
+        match: { ...match, confidence: 0.8, alternatives: [{ kind: 'badge', p: 0.5 }, { kind: 'toggle', p: 0.2 }] },
+      },
+      { type: 'reassign', id: 'p1', kind: 'badge' },
+    ])
+    expect(s.placed[0].kind).toBe('badge')
+    expect(s.placed[0].confidence).toBe(0.5)
+    expect(s.placed[0].alternatives).toEqual([
+      { kind: 'button', p: 0.8 },
+      { kind: 'toggle', p: 0.2 },
+    ])
+  })
+})

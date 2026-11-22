@@ -4,7 +4,7 @@ import { afterEach } from 'vitest'
 afterEach(cleanup)
 
 // jsdom has no PointerEvent, so pointer coordinates would be dropped.
-if (typeof window.PointerEvent === 'undefined') {
+if (typeof window !== 'undefined' && typeof window.PointerEvent === 'undefined') {
   class PointerEventPolyfill extends MouseEvent {
     pointerId: number
     pressure: number
@@ -16,4 +16,4 @@ if (typeof window.PointerEvent === 'undefined') {
   }
   window.PointerEvent = PointerEventPolyfill as unknown as typeof PointerEvent
 }
-Element.prototype.setPointerCapture ??= () => {}
+if (typeof Element !== 'undefined') Element.prototype.setPointerCapture ??= () => {}

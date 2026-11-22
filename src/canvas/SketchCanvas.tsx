@@ -16,8 +16,16 @@ const newId = (prefix: string) => `${prefix}-${++nextId}`
 
 type Mode = 'draw' | 'interact'
 
-export function SketchCanvas({ recognizer = heuristicRecognizer }: { recognizer?: Recognizer }) {
+export function SketchCanvas({
+  recognizer = heuristicRecognizer,
+  status,
+}: {
+  recognizer?: Recognizer
+  /** Shown in the toolbar, e.g. which recognizer is active. */
+  status?: string
+}) {
   const [state, dispatch] = useReducer(canvasReducer, initialState)
+  const [recognizing, setRecognizing] = useState<ReadonlySet<string>>(new Set())
   const [live, setLive] = useState<Point[] | null>(null)
   const [mode, setMode] = useState<Mode>('draw')
   const stateRef = useRef(state)
@@ -38,9 +46,13 @@ export function SketchCanvas({ recognizer = heuristicRecognizer }: { recognizer?
     const ids = new Set(pending)
     const group = strokes.filter((s) => ids.has(s.id))
     apply({ type: 'closeGroup' })
-    recognizer(group).then((match) => {
-      if (match) apply({ type: 'swap', id: newId('placed'), strokeIds: [...ids], match })
-    })
+    setRecognizing((r) => new Set([...r, ...ids]))
+    recognizer(group)
+      .then((match) => {
+        if (match) apply({ type: 'swap', id: newId('placed'), strokeIds: [...ids], match })
+      })
+      .catch((err) => console.warn('[draw-ui] recognizer failed', err))
+      .finally(() => setRecognizing((r) => new Set([...r].filter((id) => !ids.has(id)))))
   }, [recognizer, apply])
 
   useEffect(() => () => window.clearTimeout(idleTimer.current), [])
@@ -104,13 +116,22 @@ export function SketchCanvas({ recognizer = heuristicRecognizer }: { recognizer?
         onPointerCancel={onPointerUp}
       >
         <div className={mode === 'draw' ? 'pointer-events-none' : undefined}>
-          {state.placed.map((p) => (
-            <PlacedComponent key={p.id} placed={p} />
+          {state.placed.map((p, i) => (
+            <PlacedComponent
+              key={p.id}
+              placed={p}
+              showChip={mode === 'interact' || i === state.placed.length - 1}
+              onReassign={(kind) => apply({ type: 'reassign', id: p.id, kind })}
+            />
           ))}
         </div>
         <svg className="pointer-events-none absolute inset-0 size-full fill-foreground/70">
           {state.strokes.map((s) => (
-            <path key={s.id} d={svgInk(s.points, { ...INK, last: true })} />
+            <path
+              key={s.id}
+              d={svgInk(s.points, { ...INK, last: true })}
+              className={recognizing.has(s.id) ? 'animate-pulse' : undefined}
+            />
           ))}
           {live && <path d={svgInk(live, INK)} />}
         </svg>
@@ -125,6 +146,7 @@ export function SketchCanvas({ recognizer = heuristicRecognizer }: { recognizer?
           apply({ type: 'clear' })
         }}
         canUndo={state.history.length > 0}
+        status={recognizing.size > 0 ? 'Recognizing…' : status}
       />
     </div>
   )
@@ -136,6 +158,7 @@ function Toolbar(props: {
   onUndo: () => void
   onClear: () => void
   canUndo: boolean
+  status?: string
 }) {
   const btn =
     'rounded-md px-3 py-1.5 text-sm hover:bg-accent disabled:opacity-40 disabled:hover:bg-transparent'
@@ -150,6 +173,7 @@ function Toolbar(props: {
       <button className={btn} onClick={props.onClear}>
         Clear
       </button>
+      {props.status && <span className="px-2 text-xs text-muted-foreground">{props.status}</span>}
     </div>
   )
 }
