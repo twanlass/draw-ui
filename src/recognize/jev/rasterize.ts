@@ -2,9 +2,12 @@ import { svgInk } from '@/lib/freehand.js'
 import { boundsOf, type Box } from '@/lib/geometry'
 import type { Stroke } from '../types'
 
-// Jev's image limits: each side 256 to 1568 px.
-const MIN_SIDE = 256
-const MAX_SIDE = 1568
+// Jev's image limits: each side 256 to 1568 px, AND at least 78,400 px in
+// total (280 x 280). A 256 x 256 image passes the side check but fails the
+// area check with "Invalid image dimensions", so the floor is 288 per side.
+import { IMAGE_LIMITS } from './decisions'
+const MIN_SIDE = 288
+const MAX_SIDE = IMAGE_LIMITS.maxSide
 const PADDING = 12
 const INK_PX = 6
 /** Small sketches grow at most this much, then get padded, so a checkbox still looks small. */

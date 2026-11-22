@@ -1,6 +1,7 @@
 import { createServer, type Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { pngHeader } from '../src/test/png'
 import { createHandler } from './jev-plugin'
 
 let server: Server | undefined
@@ -13,7 +14,7 @@ async function serve(opts: Parameters<typeof createHandler>[0]) {
   return `http://127.0.0.1:${(server!.address() as AddressInfo).port}`
 }
 
-const body = JSON.stringify({ image: 'data:image/png;base64,AAAA', width: 140, height: 44 })
+const body = JSON.stringify({ image: pngHeader(288, 288), width: 140, height: 44 })
 const post = (url: string, b = body) => fetch(url, { method: 'POST', body: b })
 
 describe('recognize route', () => {
@@ -33,6 +34,18 @@ describe('recognize route', () => {
   it('rejects anything but a PNG or JPEG data URL', async () => {
     const url = await serve({ apiKey: 'k', model: 'm', fetch: vi.fn() })
     expect((await post(url, JSON.stringify({ image: 'https://x/y.png' }))).status).toBe(400)
+  })
+
+  it('rejects a 256x256 image before calling Jev, since it is under the pixel-count minimum', async () => {
+    const upstream = vi.fn()
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const url = await serve({ apiKey: 'k', model: 'm', fetch: upstream })
+    const res = await post(url, JSON.stringify({ image: pngHeader(256, 256), width: 24, height: 24 }))
+    expect(res.status).toBe(400)
+    expect(((await res.json()) as { error: string }).error).toContain('65536')
+    expect(upstream).not.toHaveBeenCalled()
+    expect(warn.mock.calls[0][0]).toContain('256x256')
+    warn.mockRestore()
   })
 
   it('calls Jev with the key and returns the ranking', async () => {

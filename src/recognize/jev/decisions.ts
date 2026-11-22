@@ -6,6 +6,46 @@ import { catalog, type ComponentKind } from '../catalog'
 export const DECISIONS_URL = 'https://openrouter.ai/api/alpha/decisions'
 export const DEFAULT_JEV_MODEL = 'typesafe/jev-1.14'
 
+/** Jev's documented image limits (multimodal-decisions docs). */
+export const IMAGE_LIMITS = { minSide: 256, maxSide: 1568, minArea: 78_400, maxArea: 2_458_624 }
+
+/** Width and height from a PNG or JPEG data URL's header, or null if unreadable. */
+export function imageSize(dataUrl: string): { width: number; height: number } | null {
+  const b64 = dataUrl.slice(dataUrl.indexOf(',') + 1)
+  const bytes = Uint8Array.from(atob(b64.slice(0, 64 * 1024)), (c) => c.charCodeAt(0))
+  if (bytes[0] === 0x89 && bytes[1] === 0x50 && bytes.length >= 24) {
+    const v = new DataView(bytes.buffer)
+    return { width: v.getUint32(16), height: v.getUint32(20) }
+  }
+  if (bytes[0] === 0xff && bytes[1] === 0xd8) {
+    // Walk JPEG segments to the start-of-frame marker.
+    let i = 2
+    while (i + 9 < bytes.length) {
+      if (bytes[i] !== 0xff) return null
+      const marker = bytes[i + 1]
+      const len = (bytes[i + 2] << 8) | bytes[i + 3]
+      if (marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc) {
+        return { height: (bytes[i + 5] << 8) | bytes[i + 6], width: (bytes[i + 7] << 8) | bytes[i + 8] }
+      }
+      i += 2 + len
+    }
+  }
+  return null
+}
+
+/** Why Jev would reject an image of this size, or null if it fits. */
+export function imageSizeProblem(size: { width: number; height: number }): string | null {
+  const { width: w, height: h } = size
+  const L = IMAGE_LIMITS
+  if (Math.min(w, h) < L.minSide || Math.max(w, h) > L.maxSide) {
+    return `each side must be ${L.minSide}-${L.maxSide}px, got ${w}x${h}`
+  }
+  if (w * h < L.minArea || w * h > L.maxArea) {
+    return `total pixels must be ${L.minArea}-${L.maxArea}, got ${w * h} (${w}x${h})`
+  }
+  return null
+}
+
 /** Below this, the best guess isn't trusted and the sketch stays a sketch. */
 export const MIN_PROBABILITY = 0.5
 

@@ -4,6 +4,8 @@ import {
   DECISIONS_URL,
   DEFAULT_JEV_MODEL,
   buildDecisionRequest,
+  imageSize,
+  imageSizeProblem,
   rankAnswers,
   type RecognizeInput,
 } from '../src/recognize/jev/decisions'
@@ -54,6 +56,16 @@ export function createHandler(opts: {
       return send(res, 400, { error: 'image must be a PNG or JPEG data URL' })
     }
 
+    // Check size here so a bad image fails fast with the real numbers, rather
+    // than as Jev's bare "Invalid image dimensions".
+    const size = imageSize(input.image)
+    const dims = size ? `${size.width}x${size.height}` : 'unknown size'
+    const problem = size ? imageSizeProblem(size) : 'could not read image size'
+    if (problem) {
+      console.warn(`[jev] not sent, image ${dims}: ${problem}`)
+      return send(res, 400, { error: `Image rejected before sending: ${problem}` })
+    }
+
     const started = Date.now()
     try {
       const upstream = await doFetch(DECISIONS_URL, {
@@ -69,7 +81,7 @@ export function createHandler(opts: {
       const ms = Date.now() - started
       if (!upstream.ok) {
         const message = json?.error?.message ?? `OpenRouter returned ${upstream.status}`
-        console.warn(`[jev] ${upstream.status} after ${ms}ms: ${message}`)
+        console.warn(`[jev] ${upstream.status} after ${ms}ms, image ${dims}: ${message}`)
         return send(res, 502, { error: message, status: upstream.status })
       }
       const ranked = rankAnswers(json)
@@ -77,9 +89,10 @@ export function createHandler(opts: {
         .slice(0, 3)
         .map((r) => `${r.kind} ${r.p.toFixed(2)}`)
         .join(', ')
-      console.info(`[jev] ${ms}ms, cost ${json?.usage?.cost ?? '?'}: ${top}`)
+      console.info(`[jev] ${ms}ms, image ${dims}, cost ${json?.usage?.cost ?? '?'}: ${top}`)
       return send(res, 200, { ranked, ms, cost: json?.usage?.cost ?? null })
     } catch (err) {
+      console.warn(`[jev] request failed after ${Date.now() - started}ms, image ${dims}: ${(err as Error).message}`)
       return send(res, 502, { error: (err as Error).message })
     }
   }

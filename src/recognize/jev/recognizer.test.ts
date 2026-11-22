@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import { boxStroke, scrawl } from '@/test/sketch'
+import { imageSize, imageSizeProblem } from './decisions'
 import { layoutFor } from './rasterize'
 import { createJevRecognizer, toMatch } from './recognizer'
 
@@ -42,9 +43,24 @@ describe('Jev recognizer', () => {
 })
 
 describe('image layout', () => {
-  it('scales a tiny sketch up to the 256px minimum', () => {
+  it('pads a tiny sketch out to 288px, so it clears the 78,400 pixel minimum', () => {
     const l = layoutFor({ x: 0, y: 0, w: 20, h: 20 })
-    expect(Math.min(l.width, l.height)).toBe(256)
+    expect(Math.min(l.width, l.height)).toBe(288)
+  })
+
+  it.each([
+    [24, 24],
+    [20, 20],
+    [600, 2],
+    [2, 600],
+    [140, 44],
+    [4000, 1000],
+    [1000, 4000],
+    [5000, 5000],
+    [300, 200],
+  ])('produces an image Jev accepts for a %ix%i sketch', (w, h) => {
+    const l = layoutFor({ x: 0, y: 0, w, h })
+    expect(imageSizeProblem(l)).toBeNull()
   })
 
   it('scales a huge sketch down to the 1568px maximum', () => {
@@ -55,7 +71,7 @@ describe('image layout', () => {
 
   it('pads a thin line out to the minimum side', () => {
     const l = layoutFor({ x: 0, y: 0, w: 600, h: 2 })
-    expect(l.height).toBe(256)
+    expect(l.height).toBe(288)
     expect(l.width).toBeLessThanOrEqual(1568)
   })
 })
@@ -64,6 +80,17 @@ describe('image layout keeps relative size', () => {
   it('upscales a checkbox at most 2x, padding the rest', () => {
     const l = layoutFor({ x: 0, y: 0, w: 24, h: 24 })
     expect(l.scale).toBe(2)
-    expect(l.width).toBe(256)
+    expect(l.width).toBe(288)
+  })
+})
+
+describe('imageSize', () => {
+  it('reads width and height from a PNG header', async () => {
+    const { pngHeader } = await import('@/test/png')
+    expect(imageSize(pngHeader(288, 400))).toEqual({ width: 288, height: 400 })
+  })
+
+  it('flags 256x256 as too few pixels', () => {
+    expect(imageSizeProblem({ width: 256, height: 256 })).toContain('total pixels')
   })
 })
