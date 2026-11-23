@@ -2,6 +2,7 @@ import type { ReactNode } from 'react'
 import { Bar, BarChart, XAxis } from 'recharts'
 import {
   AlertCircleIcon,
+  BatteryFullIcon,
   BoldIcon,
   ChevronRightIcon,
   FileIcon,
@@ -10,7 +11,9 @@ import {
   ItalicIcon,
   SearchIcon,
   SettingsIcon,
+  SignalIcon,
   UnderlineIcon,
+  WifiIcon,
 } from 'lucide-react'
 import { toast } from 'sonner'
 import { Accordion, AccordionContent, AccordionItem, AccordionTrigger } from '@/components/ui/accordion'
@@ -151,7 +154,7 @@ import { Toggle } from '@/components/ui/toggle'
 import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import type { Box } from '@/lib/geometry'
-import type { ComponentKind } from '@/recognize/catalog'
+import { PHONE_BEZEL, type PlacedKind } from './frames'
 
 export interface RenderProps {
   box: Box
@@ -159,16 +162,40 @@ export interface RenderProps {
 }
 
 const isWide = (b: Box) => b.w >= b.h
+
 const chartConfig = { value: { label: 'Value', color: 'var(--primary)' } } satisfies ChartConfig
 const chartData = [3, 5, 2, 6, 4, 7].map((value, i) => ({ month: 'JFMAMJ'[i], value }))
 
 /**
- * How each component looks when it replaces a sketch, filling the sketch's
- * box. Overlays (dialogs, menus, tooltips) render as their real trigger and
+ * How each component looks when it replaces a sketch, centred in the sketch's
+ * box. Containers (card, textarea, table…) fill it. Controls with a standard
+ * height (input, button, select…) take the sketch's width but keep their real
+ * height, since nobody draws a field exactly 36px tall. Overlays (dialogs, menus, tooltips) render as their real trigger and
  * open for real in interact mode, since an always-open overlay can't sit in
  * place on a canvas.
  */
-export const renderers: Record<ComponentKind, (p: RenderProps) => ReactNode> = {
+export const renderers: Record<PlacedKind, (p: RenderProps) => ReactNode> = {
+  // An invisible flex container from a Shift+drag; outlined while drawing.
+  group: () => <div className="size-full" />,
+  // A device frame: bezel, status bar and home indicator. What's drawn inside
+  // it is laid out in its screen area (see PHONE_INSETS).
+  phone: () => (
+    <div
+      className="relative size-full rounded-[44px] border-neutral-900 bg-background shadow-xl dark:border-neutral-700"
+      style={{ borderWidth: PHONE_BEZEL }}
+    >
+      <div className="flex h-11 items-center justify-between px-7 text-xs font-semibold">
+        <span>9:41</span>
+        <span className="flex items-center gap-1">
+          <SignalIcon className="size-3.5" />
+          <WifiIcon className="size-3.5" />
+          <BatteryFullIcon className="size-4" />
+        </span>
+      </div>
+      <div className="absolute left-1/2 top-2 h-6 w-24 -translate-x-1/2 rounded-full bg-neutral-900" />
+      <div className="absolute bottom-2 left-1/2 h-1 w-28 -translate-x-1/2 rounded-full bg-foreground/80" />
+    </div>
+  ),
   accordion: () => (
     <Accordion type="single" collapsible defaultValue="a" className="size-full overflow-hidden">
       {['Is it accessible?', 'Is it styled?', 'Is it animated?'].map((q, i) => (
@@ -189,7 +216,7 @@ export const renderers: Record<ComponentKind, (p: RenderProps) => ReactNode> = {
   'alert-dialog': ({ label }) => (
     <AlertDialog>
       <AlertDialogTrigger asChild>
-        <Button variant="outline" className="size-full">
+        <Button variant="outline" className="w-full">
           {label ?? 'Open alert dialog'}
         </Button>
       </AlertDialogTrigger>
@@ -220,6 +247,7 @@ export const renderers: Record<ComponentKind, (p: RenderProps) => ReactNode> = {
       </AttachmentContent>
     </Attachment>
   ),
+  // Auto layout has already sized the box to a standard size (layout.ts).
   avatar: ({ box }) => (
     <Avatar style={{ width: Math.min(box.w, box.h), height: Math.min(box.w, box.h) }}>
       <AvatarFallback>CN</AvatarFallback>
@@ -250,7 +278,7 @@ export const renderers: Record<ComponentKind, (p: RenderProps) => ReactNode> = {
       </Bubble>
     </BubbleGroup>
   ),
-  button: ({ label }) => <Button className="size-full">{label ?? 'Button'}</Button>,
+  button: ({ label }) => <Button className="w-full">{label ?? 'Button'}</Button>,
   'button-group': () => (
     <ButtonGroup>
       <Button variant="outline">Archive</Button>
@@ -340,7 +368,7 @@ export const renderers: Record<ComponentKind, (p: RenderProps) => ReactNode> = {
   dialog: ({ label }) => (
     <Dialog>
       <DialogTrigger asChild>
-        <Button variant="outline" className="size-full">
+        <Button variant="outline" className="w-full">
           {label ?? 'Open dialog'}
         </Button>
       </DialogTrigger>
@@ -359,7 +387,7 @@ export const renderers: Record<ComponentKind, (p: RenderProps) => ReactNode> = {
   drawer: ({ label }) => (
     <Drawer>
       <DrawerTrigger asChild>
-        <Button variant="outline" className="size-full">
+        <Button variant="outline" className="w-full">
           {label ?? 'Open drawer'}
         </Button>
       </DrawerTrigger>
@@ -374,7 +402,7 @@ export const renderers: Record<ComponentKind, (p: RenderProps) => ReactNode> = {
   'dropdown-menu': ({ label }) => (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
-        <Button variant="outline" className="size-full">
+        <Button variant="outline" className="w-full">
           {label ?? 'Open menu'}
         </Button>
       </DropdownMenuTrigger>
@@ -411,7 +439,7 @@ export const renderers: Record<ComponentKind, (p: RenderProps) => ReactNode> = {
       <HoverCardContent>The React Framework, created and maintained by @vercel.</HoverCardContent>
     </HoverCard>
   ),
-  input: ({ label }) => <Input className="size-full" placeholder={label ?? 'Input'} />,
+  input: ({ label }) => <Input className="w-full" placeholder={label ?? 'Input'} />,
   'input-group': () => (
     <InputGroup className="w-full">
       <InputGroupInput placeholder="Search..." />
@@ -451,7 +479,7 @@ export const renderers: Record<ComponentKind, (p: RenderProps) => ReactNode> = {
       <Kbd>K</Kbd>
     </KbdGroup>
   ),
-  label: ({ label }) => <Label>{label ?? 'Label'}</Label>,
+  label: ({ label }) => <Label className="w-full">{label ?? 'Label'}</Label>,
   marker: () => (
     <Marker>
       <MarkerContent>1</MarkerContent>
@@ -540,7 +568,7 @@ export const renderers: Record<ComponentKind, (p: RenderProps) => ReactNode> = {
   popover: ({ label }) => (
     <Popover>
       <PopoverTrigger asChild>
-        <Button variant="outline" className="size-full">
+        <Button variant="outline" className="w-full">
           {label ?? 'Open popover'}
         </Button>
       </PopoverTrigger>
@@ -595,7 +623,7 @@ export const renderers: Record<ComponentKind, (p: RenderProps) => ReactNode> = {
   sheet: ({ label }) => (
     <Sheet>
       <SheetTrigger asChild>
-        <Button variant="outline" className="size-full">
+        <Button variant="outline" className="w-full">
           {label ?? 'Open sheet'}
         </Button>
       </SheetTrigger>
@@ -643,7 +671,7 @@ export const renderers: Record<ComponentKind, (p: RenderProps) => ReactNode> = {
   ),
   slider: () => <Slider defaultValue={[50]} max={100} className="w-full" />,
   sonner: ({ label }) => (
-    <Button variant="outline" className="size-full" onClick={() => toast('Event has been created')}>
+    <Button variant="outline" className="w-full" onClick={() => toast('Event has been created')}>
       {label ?? 'Show toast'}
     </Button>
   ),
@@ -705,7 +733,7 @@ export const renderers: Record<ComponentKind, (p: RenderProps) => ReactNode> = {
   tooltip: ({ label }) => (
     <Tooltip>
       <TooltipTrigger asChild>
-        <Button variant="outline" className="size-full">
+        <Button variant="outline" className="w-full">
           {label ?? 'Hover'}
         </Button>
       </TooltipTrigger>

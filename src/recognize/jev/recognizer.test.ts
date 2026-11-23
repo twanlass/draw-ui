@@ -28,8 +28,9 @@ describe('Jev recognizer', () => {
     expect(call.mock.calls[0][0].width).toBeGreaterThan(130)
   })
 
-  it('leaves the sketch alone when nothing is likely enough', () => {
-    expect(toMatch([{ kind: 'button', p: 0.3 }], sketch)).toBeNull()
+  it('always goes with the top guess, however unsure', () => {
+    const unsure = toMatch([{ kind: 'switch', p: 0.08 }, { kind: 'input', p: 0.06 }], sketch)
+    expect(unsure).toMatchObject({ kind: 'switch', confidence: 0.08, alternatives: [{ kind: 'input', p: 0.06 }] })
     expect(toMatch([], sketch)).toBeNull()
   })
 
