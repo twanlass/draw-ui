@@ -46,9 +46,6 @@ export function imageSizeProblem(size: { width: number; height: number }): strin
   return null
 }
 
-/** Below this, the best guess isn't trusted and the sketch stays a sketch. */
-export const MIN_PROBABILITY = 0.5
-
 export interface RecognizeInput {
   /** PNG or JPEG data URL of the sketch, 256 to 1568 px per side. */
   image: string

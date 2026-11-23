@@ -1,7 +1,7 @@
 import { boundsOf } from '@/lib/geometry'
 import { findFrame, heuristicRecognizer } from '../heuristic'
 import type { Match, Recognizer, Stroke } from '../types'
-import { MIN_PROBABILITY, type RankedKind } from './decisions'
+import type { RankedKind } from './decisions'
 import { rasterize } from './rasterize'
 
 export interface JevResult {
@@ -31,10 +31,14 @@ export async function jevAvailable(): Promise<boolean> {
   }
 }
 
-/** Turn Jev's ranking into a match, or null when nothing clears the bar. */
+/**
+ * Turn Jev's ranking into a match. The top guess always wins, however unsure,
+ * since a wrong pick is one click to fix from the chip and a sketch that
+ * silently stays is worse. Null only when Jev answered nothing.
+ */
 export function toMatch(ranked: RankedKind[], strokes: Stroke[]): Match | null {
   const [best, ...rest] = ranked
-  if (!best || best.p < MIN_PROBABILITY) return null
+  if (!best) return null
   // Snap to the drawn frame when there is one; otherwise use the ink bounds.
   const box = findFrame(strokes)?.box ?? boundsOf(strokes.flatMap((s) => s.points))
   return { kind: best.kind, box, confidence: best.p, alternatives: rest.slice(0, 5) }

@@ -1,19 +1,33 @@
 import { boundsOf, distanceToBox, unionBoxes, type Box, type Point } from '@/lib/geometry'
 import type { ComponentKind, Match, Ranked, Stroke } from '@/recognize/types'
+import { isFrame, type PlacedKind } from './frames'
+import { arrange, naturalBox, stackOrder } from './layout'
 
 export interface Placed {
   id: string
-  kind: ComponentKind
+  kind: PlacedKind
+  /** Where it renders, after auto layout. */
   box: Box
+  /** Where the sketch was, so switching kind can lay it out afresh. */
+  drawnBox: Box
   label?: string
   confidence: number
   /** Other likely components, best first, for the switcher. */
   alternatives: Ranked[]
-  /** The sketch it replaced, so undo can bring it back. */
-  strokes: Stroke[]
+  /** The strokes it was drawn with, kept for feedback reports. */
+  sketch: Stroke[]
 }
 
-type HistoryEntry = { type: 'stroke'; id: string } | { type: 'swap'; placedId: string }
+type HistoryEntry =
+  | { type: 'stroke'; id: string }
+  /**
+   * `placedIds` are the components one sketch became (usually one; a control
+   * and its label make two). `moved` holds the boxes auto layout changed, as
+   * they were, for undo.
+   */
+  | { type: 'swap'; placedIds: string[]; moved: { id: string; box: Box }[] }
+  /** A component crossed out, with its old stacking position so undo restores it in place. */
+  | { type: 'erase'; placed: Placed; index: number }
 
 export interface CanvasState {
   strokes: Stroke[]
@@ -26,12 +40,34 @@ export interface CanvasState {
 export type CanvasAction =
   | { type: 'addStroke'; stroke: Stroke }
   | { type: 'closeGroup' }
-  | { type: 'swap'; id: string; strokeIds: string[]; match: Match }
+  /**
+   * Replace a sketch with a component. `extra` places more components from
+   * part of the same sketch (a control's label); `strokeIds` covers them all,
+   * and undo removes them together.
+   */
+  | { type: 'swap'; id: string; strokeIds: string[]; match: Match; extra?: { id: string; match: Match; strokeIds: string[] }[] }
   | { type: 'reassign'; id: string; kind: ComponentKind }
+  /** Put a component on the canvas directly, like a phone frame from the side toolbar. */
+  | { type: 'add'; placed: Placed }
+  /**
+   * Wrap the components centred inside `box` in an invisible flex container
+   * (a Shift+drag). Does nothing if it would wrap nothing.
+   */
+  | { type: 'group'; id: string; box: Box }
+  /** Remove a placed component along with the strokes that crossed it out. */
+  | { type: 'erase'; id: string; strokeIds: string[] }
   | { type: 'undo' }
   | { type: 'clear' }
 
 export const initialState: CanvasState = { strokes: [], pending: [], placed: [], history: [] }
+
+/** Run auto layout around `id`, returning the new list and the boxes it replaced. */
+function layOut(placed: Placed[], id: string) {
+  const moves = arrange(placed, id)
+  const previous = placed.filter((p) => moves.has(p.id)).map((p) => ({ id: p.id, box: p.box }))
+  const next = placed.map((p) => (moves.has(p.id) ? { ...p, box: moves.get(p.id)! } : p))
+  return { placed: stackOrder(next), previous }
+}
 
 export function canvasReducer(state: CanvasState, action: CanvasAction): CanvasState {
   switch (action.type) {
@@ -51,45 +87,100 @@ export function canvasReducer(state: CanvasState, action: CanvasAction): CanvasS
       const replaced = state.strokes.filter((s) => ids.has(s.id))
       // The user undid or cleared some of these strokes while recognition ran.
       if (replaced.length !== ids.size) return state
+      const extra = action.extra ?? []
+      const extraIds = new Set(extra.flatMap((e) => e.strokeIds))
+      const toPlaced = (id: string, match: Match, sketch: Stroke[]): Placed => ({
+        id,
+        kind: match.kind,
+        box: naturalBox(match.kind, match.box),
+        drawnBox: match.box,
+        label: match.label,
+        confidence: match.confidence,
+        alternatives: match.alternatives ?? [],
+        sketch,
+      })
+      const added = [
+        toPlaced(action.id, action.match, replaced.filter((s) => !extraIds.has(s.id))),
+        ...extra.map((e) => toPlaced(e.id, e.match, replaced.filter((s) => e.strokeIds.includes(s.id)))),
+      ]
+      const { placed, previous } = layOut([...state.placed, ...added], action.id)
+      const addedIds = added.map((p) => p.id)
       return {
         ...state,
         strokes: state.strokes.filter((s) => !ids.has(s.id)),
         pending: state.pending.filter((id) => !ids.has(id)),
-        placed: [
-          ...state.placed,
-          {
-            id: action.id,
-            kind: action.match.kind,
-            box: action.match.box,
-            label: action.match.label,
-            confidence: action.match.confidence,
-            alternatives: action.match.alternatives ?? [],
-            strokes: replaced,
-          },
-        ],
+        placed,
         history: [
           ...state.history.filter((h) => !(h.type === 'stroke' && ids.has(h.id))),
-          { type: 'swap', placedId: action.id },
+          { type: 'swap', placedIds: addedIds, moved: previous.filter((m) => !addedIds.includes(m.id)) },
         ],
+      }
+    }
+
+    case 'add':
+      return {
+        ...state,
+        placed: stackOrder([...state.placed, action.placed]),
+        history: [...state.history, { type: 'swap', placedIds: [action.placed.id], moved: [] }],
+      }
+
+    case 'group': {
+      const { box } = action
+      const inside = (b: Box) => {
+        const cx = b.x + b.w / 2
+        const cy = b.y + b.h / 2
+        return cx >= box.x && cx <= box.x + box.w && cy >= box.y && cy <= box.y + box.h
+      }
+      // Smaller than the rect, so dragging inside a card doesn't take the card.
+      const members = state.placed.filter((p) => inside(p.box) && p.box.w * p.box.h < box.w * box.h)
+      if (members.length === 0) return state
+      // The drag only says which components; the group itself starts snug
+      // around them, since a hand-dragged rect's edges are noise.
+      const u = unionBoxes(members.map((p) => p.box))
+      // 1px larger, so it's strictly bigger than any member and so their container.
+      const snug = { x: u.x - 1, y: u.y - 1, w: u.w + 2, h: u.h + 2 }
+      const group: Placed = { id: action.id, kind: 'group', box: snug, drawnBox: box, confidence: 1, alternatives: [], sketch: [] }
+      const { placed, previous } = layOut([...state.placed, group], action.id)
+      return {
+        ...state,
+        placed,
+        history: [...state.history, { type: 'swap', placedIds: [action.id], moved: previous.filter((m) => m.id !== action.id) }],
       }
     }
 
     case 'reassign': {
       // Swap a placed component for one of its alternatives; the old pick
-      // joins the alternatives so the user can switch back.
+      // joins the alternatives so the user can switch back. Its real size may
+      // differ, so lay it out again from where it was drawn.
+      const switched = state.placed.map((p) => {
+        if (p.id !== action.id || p.kind === action.kind || isFrame(p.kind)) return p
+        const chosen = p.alternatives.find((a) => a.kind === action.kind)
+        const rest = p.alternatives.filter((a) => a.kind !== action.kind)
+        return {
+          ...p,
+          kind: action.kind,
+          box: naturalBox(action.kind, p.drawnBox),
+          confidence: chosen?.p ?? 0,
+          alternatives: [{ kind: p.kind, p: p.confidence }, ...rest].sort((a, b) => b.p - a.p),
+        }
+      })
+      if (switched.every((p, i) => p === state.placed[i])) return state
+      return { ...state, placed: layOut(switched, action.id).placed }
+    }
+
+    case 'erase': {
+      const index = state.placed.findIndex((p) => p.id === action.id)
+      if (index === -1) return state
+      const ids = new Set(action.strokeIds)
       return {
         ...state,
-        placed: state.placed.map((p) => {
-          if (p.id !== action.id || p.kind === action.kind) return p
-          const chosen = p.alternatives.find((a) => a.kind === action.kind)
-          const rest = p.alternatives.filter((a) => a.kind !== action.kind)
-          return {
-            ...p,
-            kind: action.kind,
-            confidence: chosen?.p ?? p.confidence,
-            alternatives: [{ kind: p.kind, p: p.confidence }, ...rest].sort((a, b) => b.p - a.p),
-          }
-        }),
+        strokes: state.strokes.filter((s) => !ids.has(s.id)),
+        pending: state.pending.filter((id) => !ids.has(id)),
+        placed: state.placed.filter((p) => p.id !== action.id),
+        history: [
+          ...state.history.filter((h) => !(h.type === 'stroke' && ids.has(h.id))),
+          { type: 'erase', placed: state.placed[index], index },
+        ],
       }
     }
 
@@ -105,16 +196,22 @@ export function canvasReducer(state: CanvasState, action: CanvasAction): CanvasS
           history,
         }
       }
-      // Undoing a swap brings the sketch back. Its strokes don't rejoin a
-      // group, so they won't be recognized again, and a second undo removes
-      // them one at a time.
-      const placed = state.placed.find((p) => p.id === last.placedId)
-      if (!placed) return { ...state, history }
+      if (last.type === 'erase') {
+        const placed = [...state.placed]
+        placed.splice(last.index, 0, last.placed)
+        return { ...state, placed, history }
+      }
+      // Undoing a swap removes its components and their sketch in one go, and
+      // puts back anything auto layout moved to make room for them.
+      const gone = new Set(last.placedIds)
+      if (!state.placed.some((p) => gone.has(p.id))) return { ...state, history }
+      const restore = new Map(last.moved.map((m) => [m.id, m.box]))
       return {
         ...state,
-        strokes: [...state.strokes, ...placed.strokes],
-        placed: state.placed.filter((p) => p.id !== placed.id),
-        history: [...history, ...placed.strokes.map((s) => ({ type: 'stroke' as const, id: s.id }))],
+        placed: state.placed
+          .filter((p) => !gone.has(p.id))
+          .map((p) => (restore.has(p.id) ? { ...p, box: restore.get(p.id)! } : p)),
+        history,
       }
     }
 
@@ -130,4 +227,12 @@ export function startsNewGroup(pending: Stroke[], start: Point, gap = GROUP_BREA
   if (pending.length === 0) return false
   const box = unionBoxes(pending.map((s) => boundsOf(s.points)))
   return distanceToBox(start, box) > gap
+}
+
+/** The topmost placed component under a point, allowing `slack` px around its box. */
+export function placedAt(placed: Placed[], p: Point, slack = 8): Placed | undefined {
+  for (let i = placed.length - 1; i >= 0; i--) {
+    if (distanceToBox(p, placed[i].box) <= slack) return placed[i]
+  }
+  return undefined
 }

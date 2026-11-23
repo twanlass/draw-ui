@@ -33,8 +33,12 @@ beforeAll(() => {
 })
 
 describe('renderers', () => {
-  it('has a renderer for every catalog component', () => {
-    expect(Object.keys(renderers).sort()).toEqual(catalog.map((c) => c.kind).sort())
+  it('has a renderer for every catalog component, plus the frames', () => {
+    expect(Object.keys(renderers).sort()).toEqual([...catalog.map((c) => c.kind), 'phone', 'group'].sort())
+  })
+
+  it('renders the phone frame', () => {
+    expect(() => render(<>{renderers.phone({ box: { x: 0, y: 0, w: 360, h: 720 } })}</>)).not.toThrow()
   })
 
   it.each(catalog.map((c) => c.kind))('renders %s without throwing', (kind) => {
