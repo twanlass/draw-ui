@@ -4,22 +4,24 @@ import type { Stroke } from '@/recognize/types'
 /**
  * How long to wait after the pen lifts before treating the group as one
  * finished sketch. Short when the sketch looks done, long when it looks like
- * more is coming.
+ * more is coming. Only the gap between lifting the pen and putting it down
+ * again counts (a new stroke cancels the wait), and people usually start the
+ * next stroke within 200–400ms, so these can stay short.
  */
 export const IDLE_MS = {
   /**
    * Likely done: a mark drawn inside a frame (a button's label, a checkbox's
    * tick, a select's chevron), or a closed shape that completes a sketch.
    */
-  done: 550,
+  done: 350,
   /** Nothing in particular to go on. */
-  normal: 700,
+  normal: 450,
   /** A lone frame or circle: contents, a tick or a knob may follow. */
-  frame: 900,
+  frame: 600,
   /** A tiny mark on its own (tick, chevron, dot, a letter): detail mid-flow. */
-  detail: 1000,
+  detail: 650,
   /** A single straight line: the first side of a box, or half an X. */
-  line: 1200,
+  line: 750,
 } as const
 
 /** The longest wait, for tests and anything that must outlast every case. */

@@ -2,7 +2,7 @@ import { area, boundsOf, distanceToBox, unionBoxes, type Box, type Point } from 
 import type { ComponentKind, Match, Ranked, Stroke } from '@/recognize/types'
 import { isFixedSize, isFrame, type PlacedKind } from './frames'
 import { stepTextStyle, type TextStyle } from './textStyles'
-import { arrange, GAP, naturalBox, parentOf, PADDING, settleInto, stackOrder } from './layout'
+import { arrange, asContainer, GAP, type Gap, naturalBox, parentOf, PADDING, settleInto, stackOrder } from './layout'
 
 export interface Placed {
   id: string
@@ -45,7 +45,7 @@ type HistoryEntry =
    * Components crossed out, each with its old stacking position so undo
    * restores it in place, and the boxes containers had before re-fitting.
    */
-  | { type: 'erase'; removed: { placed: Placed; index: number }[]; moved: { id: string; box: Box }[] }
+  | { type: 'erase'; removed: { placed: Placed; index: number }[]; moved: { id: string; box: Box }[]; order: string[] }
 
 export interface CanvasState {
   strokes: Stroke[]
@@ -67,6 +67,11 @@ export type CanvasAction =
   | { type: 'reassign'; id: string; kind: ComponentKind }
   /** Put a component on the canvas directly, like a phone frame from the side toolbar. */
   | { type: 'add'; placed: Placed }
+  /**
+   * Add a component picked by name (the Cmd+K menu), centred on `at`. Like a
+   * sketch, it goes in a container under that point and gets laid out.
+   */
+  | { type: 'insert'; id: string; kind: ComponentKind; at: Point; gap?: Gap }
   /**
    * Wrap the components centred inside `box` in an invisible flex container
    * (a Shift+drag). Does nothing if it would wrap nothing.
@@ -98,6 +103,15 @@ export type CanvasAction =
 export const initialState: CanvasState = { strokes: [], pending: [], placed: [], history: [] }
 
 /** Run auto layout around `id`, returning the new list and the boxes it replaced. */
+/** How big a component picked by name starts, before layout gives it its real size. */
+function startingSize(kind: ComponentKind): { w: number; h: number } {
+  if (['card', 'chart', 'table', 'calendar', 'carousel', 'accordion', 'tabs'].includes(kind)) return { w: 360, h: 240 }
+  if (kind === 'textarea') return { w: 320, h: 96 }
+  if (kind === 'label') return { w: 120, h: 20 }
+  if (kind === 'separator') return { w: 320, h: 4 }
+  return { w: 240, h: 40 }
+}
+
 function layOut(placed: Placed[], id: string) {
   const moves = arrange(placed, id)
   const previous = placed.filter((p) => moves.has(p.id)).map((p) => ({ id: p.id, box: p.box }))
@@ -136,7 +150,7 @@ export function canvasReducer(state: CanvasState, action: CanvasAction): CanvasS
         sketch,
       })
       const added = [
-        toPlaced(action.id, action.match, replaced.filter((s) => !extraIds.has(s.id))),
+        toPlaced(action.id, asContainer(action.match, state.placed), replaced.filter((s) => !extraIds.has(s.id))),
         ...extra.map((e) => toPlaced(e.id, e.match, replaced.filter((s) => e.strokeIds.includes(s.id)))),
       ]
       // Started inside a card, group or phone, it goes in it.
@@ -162,6 +176,34 @@ export function canvasReducer(state: CanvasState, action: CanvasAction): CanvasS
         placed: stackOrder([...state.placed, action.placed]),
         history: [...state.history, { type: 'swap', placedIds: [action.placed.id], moved: [] }],
       }
+
+    case 'insert': {
+      const size = startingSize(action.kind)
+      // Into a gap (edit mode's blue line): starting on the line at its
+      // neighbours' width. Layout orders by top edge, so it slots in between.
+      const { gap } = action
+      const drawn = gap
+        ? { x: gap.x, y: gap.y, w: gap.w, h: size.h }
+        : { x: action.at.x - size.w / 2, y: action.at.y - size.h / 2, ...size }
+      const added: Placed = {
+        id: action.id,
+        kind: action.kind,
+        box: naturalBox(action.kind, drawn),
+        drawnBox: drawn,
+        confidence: 1,
+        alternatives: [],
+        sketch: [],
+      }
+      // Aimed at what's on screen, so lay out from where things are shown (as a move does).
+      const asShown = state.placed.map((p) => ({ ...p, drawnBox: p.box }))
+      const settled = settleInto(asShown, [added], action.at)
+      const { placed } = layOut([...settled.existing, ...settled.added], action.id)
+      return {
+        ...state,
+        placed,
+        history: [...state.history, { type: 'swap', placedIds: [action.id], moved: movedSince(state.placed, placed) }],
+      }
+    }
 
     case 'group': {
       const { box } = action
@@ -263,11 +305,12 @@ export function canvasReducer(state: CanvasState, action: CanvasAction): CanvasS
       let removed: { placed: Placed; index: number }[] = []
       if (from && !subtree.has(from.id)) {
         const left = all.filter((p) => parentOf(p, all) === from && !subtree.has(p.id))
-        if (left.length) placed = layOut(placed, left[0].id).placed
-        else if (from.kind === 'group') {
+        // A group of one is no group: left with one member (or none), it dissolves.
+        if (from.kind === 'group' && left.length <= 1) {
           removed = [{ placed: from, index: all.indexOf(from) }]
           placed = placed.filter((p) => p.id !== from.id)
         }
+        if (left.length) placed = layOut(placed, left[0].id).placed
       }
       placed = layOut(placed, action.id).placed
       return {
@@ -330,13 +373,15 @@ export function canvasReducer(state: CanvasState, action: CanvasAction): CanvasS
       if (!targets.length) return state
       const gone = new Set(targets.flatMap((t) => [t, ...descendantsOf(t, all)]).map((p) => p.id))
       const kidsOf = (c: Placed) => all.filter((k) => parentOf(k, all) === c)
-      // A group is only its members: once they're all gone, so is it.
+      // A group is only its members: once they're all gone, or all but one,
+      // so is it (the last one stays where it is).
       for (let grew = true; grew; ) {
         grew = false
         for (const g of all) {
           if (g.kind !== 'group' || gone.has(g.id)) continue
           const kids = kidsOf(g)
-          if (kids.length && kids.every((k) => gone.has(k.id))) {
+          const lost = kids.filter((k) => gone.has(k.id)).length
+          if (lost && kids.length - lost <= 1) {
             gone.add(g.id)
             grew = true
           }
@@ -348,6 +393,11 @@ export function canvasReducer(state: CanvasState, action: CanvasAction): CanvasS
       for (const c of new Set(all.filter((p) => gone.has(p.id)).map((p) => parentOf(p, all)))) {
         const survivor = c && !gone.has(c.id) && kidsOf(c).find((k) => !gone.has(k.id))
         if (survivor) placed = layOut(placed, survivor.id).placed
+      }
+      // The last member of a dissolved group settles into the group's place.
+      for (const g of all.filter((p) => p.kind === 'group' && gone.has(p.id))) {
+        const last = kidsOf(g).find((k) => !gone.has(k.id))
+        if (last) placed = layOut(placed, last.id).placed
       }
       const old = new Map(all.map((p) => [p.id, p.box]))
       const ids = new Set(action.strokeIds)
@@ -362,6 +412,7 @@ export function canvasReducer(state: CanvasState, action: CanvasAction): CanvasS
             type: 'erase',
             removed: all.flatMap((p, index) => (gone.has(p.id) ? [{ placed: p, index }] : [])),
             moved: placed.filter((p) => old.get(p.id) !== p.box).map((p) => ({ id: p.id, box: old.get(p.id)! })),
+            order: all.map((p) => p.id),
           },
         ],
       }
@@ -406,8 +457,10 @@ export function canvasReducer(state: CanvasState, action: CanvasAction): CanvasS
       if (last.type === 'erase') {
         const restore = new Map(last.moved.map((m) => [m.id, m.box]))
         const placed = state.placed.map((p) => (restore.has(p.id) ? { ...p, box: restore.get(p.id)! } : p))
-        // In index order, so each lands back where it was.
-        for (const r of last.removed) placed.splice(r.index, 0, r.placed)
+        for (const r of last.removed) placed.push(r.placed)
+        // Back in the stacking order it had.
+        const rank = new Map(last.order.map((id, i) => [id, i]))
+        placed.sort((a, b) => (rank.get(a.id) ?? 0) - (rank.get(b.id) ?? 0))
         return { ...state, placed, history }
       }
       // Undoing a swap removes its components and their sketch in one go, and

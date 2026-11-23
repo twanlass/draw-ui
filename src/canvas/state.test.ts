@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest'
+import { gapAt } from './layout'
 import { boxStroke, scrawl } from '@/test/sketch'
 import { unionBoxes } from '@/lib/geometry'
 import { canvasReducer, crossedOut, initialState, placedAt, startsNewGroup, type CanvasAction, type CanvasState } from './state'
@@ -419,17 +420,14 @@ describe('erasing a placed component', () => {
     expect(run([{ type: 'undo' }], after).placed).toEqual(s.placed)
   })
 
-  it('a small X takes just the component under it, and its group closes up', () => {
-    const s = form(1)
+  it('a small X takes just the component under it, and a group left with one member dissolves', () => {
+    const s = form(2)
     const label = s.placed.find((p) => p.id === 'l0')!.box
     const strokes = bigX({ x: label.x + 10, y: label.y - 4, w: 50, h: 28 })
     const ids = crossedOut(s.placed, strokes, { x: label.x + 35, y: label.y + 10 })
     expect(ids).toEqual(['l0'])
     const after = run([{ type: 'erase', ids, strokeIds: [] }], s)
-    const g = after.placed.find((p) => p.id === 'g0')!.box
-    const input = after.placed.find((p) => p.id === 'i0')!.box
-    expect(input.y).toBe(g.y)
-    expect(g.h).toBe(input.h)
+    expect(after.placed.map((p) => p.id).sort()).toEqual(['g1', 'i0', 'i1', 'l1'])
     expect(run([{ type: 'undo' }], after).placed).toEqual(s.placed)
   })
 
@@ -623,6 +621,110 @@ describe('a sketch started inside a container', () => {
     expect(c.h).toBeGreaterThan(80)
   })
 
+  it('a box drawn around components is a card, whatever the recognizer guessed', () => {
+    let s = place(initialState, 'l1', 'label', { x: 280, y: 200, w: 80, h: 24 })
+    s = place(s, 'i1', 'input', { x: 280, y: 248, w: 386, h: 76 })
+    const st = boxStroke(200, 125, 538, 294)
+    const t = run(
+      [
+        { type: 'addStroke', stroke: st },
+        { type: 'closeGroup' },
+        { type: 'swap', id: 'box', strokeIds: [st.id], match: { kind: 'textarea', box: { x: 200, y: 125, w: 538, h: 294 }, confidence: 0.7, alternatives: [{ kind: 'card', p: 0.2 }] } },
+      ],
+      s,
+    )
+    const box = t.placed.find((p) => p.id === 'box')!
+    expect(box.kind).toBe('card')
+    expect(box.alternatives[0]).toEqual({ kind: 'textarea', p: 0.7 })
+    for (const id of ['l1', 'i1']) expect(inside(box.box, at(t, id))).toBe(true)
+  })
+
+  it('an empty box is left to the recognizer', () => {
+    const s = place(initialState, 'i1', 'input', { x: 900, y: 248, w: 300, h: 40 })
+    const st = boxStroke(200, 125, 300, 100)
+    const t = run(
+      [
+        { type: 'addStroke', stroke: st },
+        { type: 'closeGroup' },
+        { type: 'swap', id: 'ta', strokeIds: [st.id], match: { kind: 'textarea', box: { x: 200, y: 125, w: 300, h: 100 }, confidence: 0.7 } },
+      ],
+      s,
+    )
+    expect(t.placed.find((p) => p.id === 'ta')!.kind).toBe('textarea')
+  })
+
+  it('a component picked by name goes in the card under the point, and undo removes it', () => {
+    const s = place(initialState, 'card', 'card', { x: 100, y: 100, w: 400, h: 240 })
+    const t = run([{ type: 'insert', id: 'b', kind: 'button', at: { x: 300, y: 200 } }], s)
+    const b = at(t, 'b')
+    expect(inside(at(t, 'card'), b)).toBe(true)
+    expect(b.x).toBe(at(t, 'card').x + 24)
+    expect(run([{ type: 'undo' }], t).placed).toEqual(s.placed)
+  })
+
+  it('a component picked from a gap (the blue line) slots in right there, and undo puts things back', () => {
+    let s = place(initialState, 'card', 'card', { x: 100, y: 100, w: 420, h: 300 })
+    s = place(s, 'l', 'label', { x: 130, y: 130, w: 120, h: 24 })
+    s = place(s, 'i', 'input', { x: 130, y: 170, w: 360, h: 40 })
+    s = place(s, 'b', 'button', { x: 130, y: 240, w: 360, h: 40 })
+    const order = (t: CanvasState) => ['l', 'i', 'b', 'new'].sort((a, b) => at(t, a).y - at(t, b).y)
+    for (const [lower, upper, kind] of [
+      ['l', 'i', 'button'],
+      ['i', 'b', 'button'],
+      ['l', 'i', 'textarea'],
+      ['i', 'b', 'textarea'],
+    ] as const) {
+      const gap = gapAt(s.placed, { x: 300, y: (at(s, lower).y + at(s, lower).h + at(s, upper).y) / 2 })!
+      expect(gap).not.toBeNull()
+      const t = run([{ type: 'insert', id: 'new', kind, at: { x: gap.x + gap.w / 2, y: gap.y }, gap }], s)
+      const want = ['l', 'i', 'b']
+      want.splice(want.indexOf(upper), 0, 'new')
+      expect(order(t)).toEqual(want)
+      expect(inside(at(t, 'card'), at(t, 'new'))).toBe(true)
+      expect(at(t, 'new').x).toBe(at(t, 'i').x)
+      expect(at(t, 'new').w).toBe(at(t, 'i').w)
+      // Stacked with nothing overlapping.
+      const ys = want.map((id) => at(t, id))
+      for (let k = 1; k < ys.length; k++) expect(ys[k].y).toBeGreaterThanOrEqual(ys[k - 1].y + ys[k - 1].h)
+      if (kind === 'textarea') expect(at(t, 'new').h).toBeGreaterThanOrEqual(60)
+      expect(run([{ type: 'undo' }], t).placed).toEqual(s.placed)
+    }
+  })
+
+  it('in a card, the space before the first and after the last is a gap too', () => {
+    let s = place(initialState, 'card', 'card', { x: 100, y: 100, w: 420, h: 300 })
+    s = place(s, 'l', 'label', { x: 130, y: 130, w: 120, h: 24 })
+    s = place(s, 'i', 'input', { x: 130, y: 170, w: 360, h: 40 })
+    const card = at(s, 'card')
+    const [l, i] = [at(s, 'l'), at(s, 'i')]
+    const above = gapAt(s.placed, { x: 300, y: card.y + 6 })!
+    const below = gapAt(s.placed, { x: 300, y: card.y + card.h - 6 })!
+    expect(above.y).toBeGreaterThan(card.y)
+    expect(above.y).toBeLessThan(l.y)
+    expect(below.y).toBeGreaterThan(i.y + i.h)
+    expect(below.y).toBeLessThan(card.y + card.h)
+    for (const [gap, want] of [
+      [above, ['new', 'l', 'i']],
+      [below, ['l', 'i', 'new']],
+    ] as const) {
+      const t = run([{ type: 'insert', id: 'new', kind: 'button', at: { x: gap.x + gap.w / 2, y: gap.y }, gap }], s)
+      expect(['l', 'i', 'new'].sort((a, b) => at(t, a).y - at(t, b).y)).toEqual(want)
+      expect(inside(at(t, 'card'), at(t, 'new'))).toBe(true)
+      expect(run([{ type: 'undo' }], t).placed).toEqual(s.placed)
+    }
+  })
+
+  it('finds no gap over a component or beside the stack', () => {
+    let s = place(initialState, 'l', 'label', { x: 130, y: 130, w: 120, h: 24 })
+    s = place(s, 'i', 'input', { x: 130, y: 170, w: 360, h: 40 })
+    const i = at(s, 'i')
+    expect(gapAt(s.placed, { x: i.x + 20, y: i.y + i.h / 2 })).toBeNull()
+    expect(gapAt(s.placed, { x: i.x + i.w + 50, y: i.y - 4 })).toBeNull()
+    // On the bare canvas there's no "before the first" or "after the last".
+    expect(gapAt(s.placed, { x: i.x + 20, y: at(s, 'l').y - 10 })).toBeNull()
+    expect(gapAt(s.placed, { x: i.x + 20, y: i.y + i.h + 10 })).toBeNull()
+  })
+
   it('starting outside leaves it outside', () => {
     const s = place(initialState, 'card', 'card', { x: 100, y: 100, w: 400, h: 200 })
     const t = place(s, 'btn', 'button', { x: 600, y: 150, w: 120, h: 40 })
@@ -693,6 +795,21 @@ describe('moving a component (edit mode)', () => {
     const u = run([{ type: 'move', id: 'btn', dx: out.x - (at(t, 'btn').x + 10), dy: out.y - (at(t, 'btn').y + 10), at: out }], t)
     expect(inside(at(u, 'card'), at(u, 'btn'))).toBe(false)
     expect(at(u, 'g1').y).toBe(at(u, 'card').y + 24)
+  })
+
+  it('moving one of two out of a group dissolves the group; the other stays in the card', () => {
+    const s = setup()
+    const g1 = at(s, 'g1')
+    const card = at(s, 'card')
+    // The label of the first group, to the bottom of the card.
+    const drop = { x: g1.x + 300, y: card.y + card.h - 20 }
+    const l1 = at(s, 'l1')
+    const t = run([{ type: 'move', id: 'l1', dx: drop.x - (l1.x + 10), dy: drop.y - (l1.y + 10), at: drop }], s)
+    expect(t.placed.some((p) => p.id === 'g1')).toBe(false)
+    expect(inside(at(t, 'card'), at(t, 'i1'))).toBe(true)
+    expect(inside(at(t, 'card'), at(t, 'l1'))).toBe(true)
+    expect(at(t, 'i1').y).toBe(at(t, 'card').y + 24)
+    expect(run([{ type: 'undo' }], t).placed).toEqual(s.placed)
   })
 
   it('moving the only thing out of a group removes the group, and undo brings it back', () => {

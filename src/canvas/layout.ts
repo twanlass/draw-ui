@@ -1,5 +1,5 @@
 import { area, center, containsBox, type Box } from '@/lib/geometry'
-import type { ComponentKind } from '@/recognize/types'
+import type { ComponentKind, Match } from '@/recognize/types'
 import { GROUP_INSETS, isFixedSize, isFrame, PHONE_INSETS, type Insets, type PlacedKind } from './frames'
 import { textStyleInfo, type TextStyle } from './textStyles'
 
@@ -175,6 +175,61 @@ const hugsNext = (i: Item | null | undefined) => i?.kind === 'label' && (i.textS
 
 /** Only these hold other components; an input that happens to overlap a label doesn't. */
 const canContain = (kind: PlacedKind) => kind === 'card' || isFrame(kind)
+
+/** Where a new component would slot in between two stacked ones: a line across the gap. */
+export interface Gap {
+  x: number
+  y: number
+  w: number
+}
+
+/**
+ * The gap between two components stacked one above the other, in the
+ * container under `p` (or on the canvas), if `p` is in it. A few pixels of
+ * slack either side, since the gaps themselves are only 8–16px. Inside a
+ * container, also the space above its first component and below its last.
+ */
+export function gapAt<T extends Item>(items: T[], p: { x: number; y: number }, slack = 4): Gap | null {
+  const host = containerAt(items, p)
+  const kids = items.filter((i) => parentOf(i, items) === host).sort((a, b) => a.box.y - b.box.y)
+  for (let i = 1; i < kids.length; i++) {
+    const [a, b] = [kids[i - 1].box, kids[i].box]
+    const x = Math.min(a.x, b.x)
+    const w = Math.max(right(a), right(b)) - x
+    const stacked = b.y >= bottom(a) - 1 && Math.min(right(a), right(b)) > Math.max(a.x, b.x)
+    if (!stacked) continue
+    if (p.x < x || p.x > x + w || p.y < bottom(a) - slack || p.y > b.y + slack) continue
+    return { x, y: (bottom(a) + b.y) / 2, w }
+  }
+  // In a card, group or phone, there's also room before the first and after
+  // the last: from the container's edge to them. The line stays just inside
+  // the container, so what's picked goes in it.
+  if (!host || !kids.length) return null
+  const x = Math.min(...kids.map((k) => k.box.x))
+  const w = Math.max(...kids.map((k) => right(k.box))) - x
+  if (p.x < x || p.x > x + w) return null
+  const h = host.box
+  const top = Math.min(...kids.map((k) => k.box.y))
+  const end = Math.max(...kids.map((k) => bottom(k.box)))
+  const within = (y: number) => Math.min(Math.max(y, h.y + 1), bottom(h) - 1)
+  if (p.y >= h.y && p.y < top) return { x, y: within(Math.max((h.y + top) / 2, top - 8)), w }
+  if (p.y > end && p.y <= bottom(h)) return { x, y: within(Math.min((end + bottom(h)) / 2, end + 8)), w }
+  return null
+}
+
+/**
+ * A box drawn around components already on the canvas is meant to hold them.
+ * The recognizer only sees the new strokes, so a big empty rectangle can read
+ * as a textarea or input; whatever it guessed, it becomes a card.
+ */
+export function asContainer(match: Match, items: Item[]): Match {
+  if (canContain(match.kind)) return match
+  // Clearly bigger than what it surrounds: redrawing over a component isn't wrapping it.
+  if (!items.some((i) => containsBox(match.box, i.box, 8) && area(match.box) > 1.5 * area(i.box))) return match
+  const guessed = { kind: match.kind, p: match.confidence }
+  const others = (match.alternatives ?? []).filter((a) => a.kind !== 'card' && a.kind !== match.kind)
+  return { ...match, kind: 'card', alternatives: [guessed, ...others] }
+}
 
 /** The tightest card, group or phone under a point, bigger than `minArea`. */
 export function containerAt<T extends Item>(items: T[], p: { x: number; y: number }, minArea = 0): T | undefined {
