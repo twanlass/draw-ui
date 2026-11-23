@@ -6,20 +6,21 @@ import { GuessList } from './GuessList'
 import { renderers } from './renderers'
 import type { Placed } from './state'
 
-/** When the match chip shows: on hover (interacting), always (debug), or never. */
-export type ChipMode = 'hover' | 'always'
-
 /** Renders the real shadcn component at the sketch's position and size. */
 export function PlacedComponent({
   placed,
   chip,
+  offset,
   onReassign,
 }: {
   placed: Placed
-  chip?: ChipMode
+  /** Show the match chip (debug mode), to switch a wrong guess and report it. */
+  chip?: boolean
+  /** Being dragged (edit mode): drawn this far from its place, above everything. */
+  offset?: { x: number; y: number }
   onReassign: (kind: ComponentKind) => void
 }) {
-  const { box, kind, label } = placed
+  const { box, kind, label, textStyle } = placed
   const Render = renderers[kind]
   const ref = useRef<HTMLDivElement>(null)
   const chipTop = useContentBottom(ref, kind)
@@ -27,49 +28,50 @@ export function PlacedComponent({
     <div
       ref={ref}
       data-kind={kind}
-      // Hovered, or with its menu open, it rises above its neighbours so its
-      // chip and menu aren't hidden under components placed later. A frame
-      // has no chip and must stay beneath what's drawn in it.
+      data-id={placed.id}
+      // With a chip, hovered or with its menu open, it rises above its
+      // neighbours so its chip and menu aren't hidden under components placed
+      // later. A frame has no chip and must stay beneath what's drawn in it.
       className={cn(
-        'group/placed absolute flex items-center justify-start transition-[left,top,width,height] ease-out animate-in fade-in zoom-in-95 duration-200',
-        !isFrame(kind) && 'hover:z-30 has-[[data-chip-open]]:z-40',
+        'absolute flex items-center justify-start transition-[left,top,width,height] ease-out animate-in fade-in zoom-in-95 duration-200',
+        chip && !isFrame(kind) && 'hover:z-30 has-[[data-chip-open]]:z-40',
+        offset && 'z-50 opacity-80 shadow-lg transition-none',
       )}
-      style={{ left: box.x, top: box.y, width: box.w, height: box.h }}
+      style={{
+        left: box.x,
+        top: box.y,
+        width: box.w,
+        height: box.h,
+        transform: offset ? `translate(${offset.x}px, ${offset.y}px)` : undefined,
+      }}
     >
       <RenderBoundary key={kind} kind={kind}>
-        <Render box={box} label={label} />
+        <Render box={box} label={label} textStyle={textStyle} />
       </RenderBoundary>
-      {chip && !isFrame(kind) && <MatchChip placed={placed} mode={chip} top={chipTop} onReassign={onReassign} />}
+      {chip && !isFrame(kind) && <MatchChip placed={placed} top={chipTop} onReassign={onReassign} />}
     </div>
   )
 }
 
 /**
- * What the sketch was read as, with Jev's confidence. Opens the runner-up
- * components so a wrong guess is one click to fix. On hover it shows only
- * while its component is hovered (or its menu is open), so a tight stack of
- * components doesn't bury itself in chips. In debug mode it always shows and
- * the menu lists every component, so any wrong guess can be corrected.
+ * What the sketch was read as, with Jev's confidence, shown in debug mode.
+ * Opens the runner-up components and then every other one, so any wrong
+ * guess is one click to correct (and report).
  */
 function MatchChip({
   placed,
-  mode,
   top,
   onReassign,
 }: {
   placed: Placed
-  mode: ChipMode
   top: number | undefined
   onReassign: (kind: ComponentKind) => void
 }) {
   const [open, setOpen] = useState(false)
   const ref = useRef<HTMLDivElement>(null)
-  const debug = mode === 'always'
-  const others = debug
-    ? catalog
-        .map((c) => c.kind)
-        .filter((k) => k !== placed.kind && !placed.alternatives.some((a) => a.kind === k))
-    : []
+  const others = catalog
+    .map((c) => c.kind)
+    .filter((k) => k !== placed.kind && !placed.alternatives.some((a) => a.kind === k))
   const canSwitch = placed.alternatives.length > 0 || others.length > 0
 
   // Clicking anywhere else closes the menu.
@@ -88,10 +90,7 @@ function MatchChip({
       data-chip-open={open || undefined}
       // Padding, not margin, above the chip, so the pointer can cross from
       // the component to the chip without leaving it.
-      className={cn(
-        'pointer-events-auto absolute left-0 top-full z-20 pt-1 text-xs',
-        !debug && 'invisible group-hover/placed:visible data-[chip-open]:visible',
-      )}
+      className="pointer-events-auto absolute left-0 top-full z-20 pt-1 text-xs"
       style={top === undefined ? undefined : { top }}
       // Don't start a stroke when clicking the chip while drawing.
       onPointerDown={(e) => e.stopPropagation()}

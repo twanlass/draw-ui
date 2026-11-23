@@ -7,26 +7,25 @@ import { createJevRecognizer, jevAvailable } from '@/recognize/jev/recognizer'
 import type { Recognizer } from '@/recognize/types'
 
 const jevRecognizer = createJevRecognizer()
+/** Debug mode (match chips, feedback reports) is only offered with ?debug in the URL. */
+const showDebug = new URLSearchParams(window.location.search).has('debug')
 
 export default function App() {
   // Use Jev when the dev server has an OpenRouter key; otherwise shapes only.
-  const [engine, setEngine] = useState<{ recognizer: Recognizer; status: string }>({
+  const [engine, setEngine] = useState<{ recognizer: Recognizer; name: string }>({
     recognizer: heuristicRecognizer,
-    status: 'Shapes only',
+    name: 'Shapes only',
   })
   useEffect(() => {
     jevAvailable().then((ok) => {
-      if (ok) setEngine({ recognizer: jevRecognizer, status: 'Jev' })
+      if (ok) setEngine({ recognizer: jevRecognizer, name: 'Jev' })
     })
   }, [])
 
   return (
     <TooltipProvider>
       <main className="h-dvh w-full bg-background">
-        <p className="pointer-events-none absolute left-4 top-4 z-10 text-sm text-muted-foreground">
-          Sketch a component. Pause, and it becomes the real thing. P toggles drawing, Cmd+Z undoes.
-        </p>
-        <SketchCanvas recognizer={engine.recognizer} status={engine.status} />
+        <SketchCanvas recognizer={engine.recognizer} engine={engine.name} showDebug={showDebug} />
       </main>
       <Toaster />
     </TooltipProvider>

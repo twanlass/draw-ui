@@ -1,7 +1,8 @@
-import { boundsOf, distanceToBox, unionBoxes, type Box, type Point } from '@/lib/geometry'
+import { area, boundsOf, distanceToBox, unionBoxes, type Box, type Point } from '@/lib/geometry'
 import type { ComponentKind, Match, Ranked, Stroke } from '@/recognize/types'
-import { isFrame, type PlacedKind } from './frames'
-import { arrange, naturalBox, stackOrder } from './layout'
+import { isFixedSize, isFrame, type PlacedKind } from './frames'
+import { stepTextStyle, type TextStyle } from './textStyles'
+import { arrange, GAP, naturalBox, parentOf, PADDING, settleInto, stackOrder } from './layout'
 
 export interface Placed {
   id: string
@@ -16,7 +17,12 @@ export interface Placed {
   alternatives: Ranked[]
   /** The strokes it was drawn with, kept for feedback reports. */
   sketch: Stroke[]
+  /** For a label: which kind of text (label when unset). */
+  textStyle?: TextStyle
 }
+
+/** A component's boxes before an action moved it, for undo. */
+type Moved = { id: string; box: Box; drawnBox?: Box }
 
 type HistoryEntry =
   | { type: 'stroke'; id: string }
@@ -25,9 +31,21 @@ type HistoryEntry =
    * and its label make two). `moved` holds the boxes auto layout changed, as
    * they were, for undo.
    */
-  | { type: 'swap'; placedIds: string[]; moved: { id: string; box: Box }[] }
-  /** A component crossed out, with its old stacking position so undo restores it in place. */
-  | { type: 'erase'; placed: Placed; index: number }
+  | { type: 'swap'; placedIds: string[]; moved: Moved[] }
+  /**
+   * A component dragged somewhere else (edit mode): every box as it was, and
+   * any group it left empty, for undo.
+   */
+  | { type: 'move'; moved: Moved[]; removed: { placed: Placed; index: number }[]; order: string[] }
+  /** A component's text edited, with what it was, for undo. */
+  | { type: 'text'; id: string; from: string | undefined }
+  /** A label's text style changed, with what it was, for undo. */
+  | { type: 'restyle'; id: string; from: TextStyle | undefined; moved: Moved[] }
+  /**
+   * Components crossed out, each with its old stacking position so undo
+   * restores it in place, and the boxes containers had before re-fitting.
+   */
+  | { type: 'erase'; removed: { placed: Placed; index: number }[]; moved: { id: string; box: Box }[] }
 
 export interface CanvasState {
   strokes: Stroke[]
@@ -54,8 +72,26 @@ export type CanvasAction =
    * (a Shift+drag). Does nothing if it would wrap nothing.
    */
   | { type: 'group'; id: string; box: Box }
-  /** Remove a placed component along with the strokes that crossed it out. */
-  | { type: 'erase'; id: string; strokeIds: string[] }
+  /**
+   * Copy the last thing created (everything one sketch became, with anything
+   * inside it) straight below the original. Copies get ids `${id}-0`, `${id}-1`…
+   */
+  | { type: 'duplicate'; id: string }
+  /**
+   * Remove placed components, with anything inside them, along with the
+   * strokes that crossed them out. Groups left empty go too; containers left
+   * with less in them re-fit.
+   */
+  | { type: 'erase'; ids: string[]; strokeIds: string[] }
+  /**
+   * Drag a component (and anything in it) by `dx`, `dy`, dropping it with the
+   * pointer at `at`: it joins the container under the pointer, or the canvas.
+   */
+  | { type: 'move'; id: string; dx: number; dy: number; at: Point }
+  /** Set a component's text (a label, button text, a placeholder); empty goes back to the default. */
+  | { type: 'setText'; id: string; text: string }
+  /** Step a label's text style up (+1) or down (-1): help, label, body, subtitle, title. */
+  | { type: 'restyle'; id: string; step: 1 | -1 }
   | { type: 'undo' }
   | { type: 'clear' }
 
@@ -103,7 +139,10 @@ export function canvasReducer(state: CanvasState, action: CanvasAction): CanvasS
         toPlaced(action.id, action.match, replaced.filter((s) => !extraIds.has(s.id))),
         ...extra.map((e) => toPlaced(e.id, e.match, replaced.filter((s) => e.strokeIds.includes(s.id)))),
       ]
-      const { placed, previous } = layOut([...state.placed, ...added], action.id)
+      // Started inside a card, group or phone, it goes in it.
+      const start = replaced[0]?.points[0]
+      const settled = start ? settleInto(state.placed, added, start) : { existing: state.placed, added }
+      const { placed } = layOut([...settled.existing, ...settled.added], action.id)
       const addedIds = added.map((p) => p.id)
       return {
         ...state,
@@ -112,7 +151,7 @@ export function canvasReducer(state: CanvasState, action: CanvasAction): CanvasS
         placed,
         history: [
           ...state.history.filter((h) => !(h.type === 'stroke' && ids.has(h.id))),
-          { type: 'swap', placedIds: addedIds, moved: previous.filter((m) => !addedIds.includes(m.id)) },
+          { type: 'swap', placedIds: addedIds, moved: movedSince(state.placed, placed) },
         ],
       }
     }
@@ -148,6 +187,123 @@ export function canvasReducer(state: CanvasState, action: CanvasAction): CanvasS
       }
     }
 
+    case 'duplicate': {
+      const source = lastCreated(state)
+      if (!source.length) return state
+      const all = [...new Set([...source, ...source.flatMap((p) => descendantsOf(p, state.placed))])]
+      const at = unionBoxes(source.map((p) => p.box))
+      const dy = at.h + GAP
+      const ids = new Map(all.map((p, i) => [p.id, `${action.id}-${i}`]))
+      // A copy is "drawn" where it lands, below the original as laid out, not
+      // offset from the original's sketch: a group's sketch is the rect you
+      // dragged, often much taller than the group, and layout reasons from
+      // drawn boxes, so that would leave a big gap.
+      const copies = all.map((p) => {
+        const box = { ...p.box, y: p.box.y + dy }
+        return { ...p, id: ids.get(p.id)!, box, drawnBox: box }
+      })
+      // Stretch the containers the original is in so the copy lands inside
+      // them too; layout then fits them properly.
+      const bottomNeeded = at.y + at.h + dy
+      const grown = new Map<string, Box>()
+      for (let c = parentOf(source[0], state.placed); c && !isFixedSize(c.kind); c = parentOf(c, state.placed)) {
+        const box = grown.get(c.id) ?? c.box
+        const h = Math.max(box.h, bottomNeeded + PADDING - box.y)
+        grown.set(c.id, { ...box, h })
+      }
+      // Make room: push what's below the original down by the copy's height,
+      // as if the copy were inserted there. Otherwise it lands on whatever is
+      // next in the column, and layout hands its contents to that instead.
+      const copied = new Set(all.map((p) => p.id))
+      const isBelow = (p: Placed) =>
+        !copied.has(p.id) && !grown.has(p.id) && p.box.y >= at.y + at.h - 4 && p.box.x < at.x + at.w && at.x < p.box.x + p.box.w
+      const down = (b: Box) => ({ ...b, y: b.y + dy })
+      const before = state.placed.map((p) =>
+        grown.has(p.id) ? { ...p, box: grown.get(p.id)! } : isBelow(p) ? { ...p, box: down(p.box), drawnBox: down(p.drawnBox) } : p,
+      )
+      const { placed } = layOut([...before, ...copies], ids.get(source[0].id)!)
+      const old = new Map(state.placed.map((p) => [p.id, p]))
+      return {
+        ...state,
+        placed,
+        history: [
+          ...state.history,
+          {
+            type: 'swap',
+            placedIds: copies.map((p) => p.id),
+            moved: placed
+              .filter((p) => old.has(p.id) && (old.get(p.id)!.box !== p.box || old.get(p.id)!.drawnBox !== p.drawnBox))
+              .map((p) => ({ id: p.id, box: old.get(p.id)!.box, drawnBox: old.get(p.id)!.drawnBox })),
+          },
+        ],
+      }
+    }
+
+    case 'move': {
+      const all = state.placed
+      const target = all.find((p) => p.id === action.id)
+      if (!target || (!action.dx && !action.dy)) return state
+      const subtree = new Set([target, ...descendantsOf(target, all)].map((p) => p.id))
+      const from = parentOf(target, all)
+      // Layout reasons from where things were drawn, which can be far from
+      // where they now show. A drop is aimed at what's on screen, so take the
+      // layout as it stands as the drawing, then move the dragged items.
+      const shift = (b: Box) => ({ ...b, x: b.x + action.dx, y: b.y + action.dy })
+      const asShown = all.map((p) => {
+        const box = subtree.has(p.id) ? shift(p.box) : p.box
+        return { ...p, box, drawnBox: box }
+      })
+      const settled = settleInto(
+        asShown.filter((p) => !subtree.has(p.id)),
+        asShown.filter((p) => subtree.has(p.id)),
+        action.at,
+      )
+      let placed = stackOrder([...settled.existing, ...settled.added])
+      // Close up where it came from; a group it leaves empty goes.
+      let removed: { placed: Placed; index: number }[] = []
+      if (from && !subtree.has(from.id)) {
+        const left = all.filter((p) => parentOf(p, all) === from && !subtree.has(p.id))
+        if (left.length) placed = layOut(placed, left[0].id).placed
+        else if (from.kind === 'group') {
+          removed = [{ placed: from, index: all.indexOf(from) }]
+          placed = placed.filter((p) => p.id !== from.id)
+        }
+      }
+      placed = layOut(placed, action.id).placed
+      return {
+        ...state,
+        placed,
+        history: [...state.history, { type: 'move', moved: movedSince(all, placed), removed, order: all.map((p) => p.id) }],
+      }
+    }
+
+    case 'setText': {
+      const target = state.placed.find((p) => p.id === action.id)
+      const label = action.text.trim() || undefined
+      if (!target || target.label === label) return state
+      return {
+        ...state,
+        placed: state.placed.map((p) => (p === target ? { ...p, label } : p)),
+        history: [...state.history, { type: 'text', id: action.id, from: target.label }],
+      }
+    }
+
+    case 'restyle': {
+      const target = state.placed.find((p) => p.id === action.id)
+      if (!target || target.kind !== 'label') return state
+      const textStyle = stepTextStyle(target.textStyle, action.step)
+      if (textStyle === (target.textStyle ?? 'label')) return state
+      const restyled = state.placed.map((p) =>
+        p === target ? { ...p, textStyle, box: { ...p.box, h: naturalBox('label', p.drawnBox, textStyle).h } } : p,
+      )
+      const { placed } = layOut(restyled, action.id)
+      return {
+        ...state,
+        placed,
+        history: [...state.history, { type: 'restyle', id: action.id, from: target.textStyle, moved: movedSince(state.placed, placed) }],
+      }
+    }
+
     case 'reassign': {
       // Swap a placed component for one of its alternatives; the old pick
       // joins the alternatives so the user can switch back. Its real size may
@@ -159,7 +315,7 @@ export function canvasReducer(state: CanvasState, action: CanvasAction): CanvasS
         return {
           ...p,
           kind: action.kind,
-          box: naturalBox(action.kind, p.drawnBox),
+          box: naturalBox(action.kind, p.drawnBox, p.textStyle),
           confidence: chosen?.p ?? 0,
           alternatives: [{ kind: p.kind, p: p.confidence }, ...rest].sort((a, b) => b.p - a.p),
         }
@@ -169,17 +325,44 @@ export function canvasReducer(state: CanvasState, action: CanvasAction): CanvasS
     }
 
     case 'erase': {
-      const index = state.placed.findIndex((p) => p.id === action.id)
-      if (index === -1) return state
+      const all = state.placed
+      const targets = all.filter((p) => action.ids.includes(p.id))
+      if (!targets.length) return state
+      const gone = new Set(targets.flatMap((t) => [t, ...descendantsOf(t, all)]).map((p) => p.id))
+      const kidsOf = (c: Placed) => all.filter((k) => parentOf(k, all) === c)
+      // A group is only its members: once they're all gone, so is it.
+      for (let grew = true; grew; ) {
+        grew = false
+        for (const g of all) {
+          if (g.kind !== 'group' || gone.has(g.id)) continue
+          const kids = kidsOf(g)
+          if (kids.length && kids.every((k) => gone.has(k.id))) {
+            gone.add(g.id)
+            grew = true
+          }
+        }
+      }
+      let placed = all.filter((p) => !gone.has(p.id))
+      // Close up what's left in each container something was erased from, by
+      // laying out from a remaining member (so a card keeps its room).
+      for (const c of new Set(all.filter((p) => gone.has(p.id)).map((p) => parentOf(p, all)))) {
+        const survivor = c && !gone.has(c.id) && kidsOf(c).find((k) => !gone.has(k.id))
+        if (survivor) placed = layOut(placed, survivor.id).placed
+      }
+      const old = new Map(all.map((p) => [p.id, p.box]))
       const ids = new Set(action.strokeIds)
       return {
         ...state,
         strokes: state.strokes.filter((s) => !ids.has(s.id)),
         pending: state.pending.filter((id) => !ids.has(id)),
-        placed: state.placed.filter((p) => p.id !== action.id),
+        placed,
         history: [
           ...state.history.filter((h) => !(h.type === 'stroke' && ids.has(h.id))),
-          { type: 'erase', placed: state.placed[index], index },
+          {
+            type: 'erase',
+            removed: all.flatMap((p, index) => (gone.has(p.id) ? [{ placed: p, index }] : [])),
+            moved: placed.filter((p) => old.get(p.id) !== p.box).map((p) => ({ id: p.id, box: old.get(p.id)! })),
+          },
         ],
       }
     }
@@ -196,21 +379,50 @@ export function canvasReducer(state: CanvasState, action: CanvasAction): CanvasS
           history,
         }
       }
+      if (last.type === 'move') {
+        const restore = new Map(last.moved.map((m) => [m.id, m]))
+        const placed = state.placed.map((p) => {
+          const m = restore.get(p.id)
+          return m ? { ...p, box: m.box, drawnBox: m.drawnBox ?? p.drawnBox } : p
+        })
+        for (const r of last.removed) placed.splice(r.index, 0, r.placed)
+        // Back in the stacking order it had.
+        const rank = new Map(last.order.map((id, i) => [id, i]))
+        placed.sort((a, b) => (rank.get(a.id) ?? 0) - (rank.get(b.id) ?? 0))
+        return { ...state, placed, history }
+      }
+      if (last.type === 'text') {
+        return { ...state, placed: state.placed.map((p) => (p.id === last.id ? { ...p, label: last.from } : p)), history }
+      }
+      if (last.type === 'restyle') {
+        const restore = new Map(last.moved.map((m) => [m.id, m]))
+        const placed = state.placed.map((p) => {
+          const m = restore.get(p.id)
+          const back = m ? { ...p, box: m.box, drawnBox: m.drawnBox ?? p.drawnBox } : p
+          return p.id === last.id ? { ...back, textStyle: last.from } : back
+        })
+        return { ...state, placed, history }
+      }
       if (last.type === 'erase') {
-        const placed = [...state.placed]
-        placed.splice(last.index, 0, last.placed)
+        const restore = new Map(last.moved.map((m) => [m.id, m.box]))
+        const placed = state.placed.map((p) => (restore.has(p.id) ? { ...p, box: restore.get(p.id)! } : p))
+        // In index order, so each lands back where it was.
+        for (const r of last.removed) placed.splice(r.index, 0, r.placed)
         return { ...state, placed, history }
       }
       // Undoing a swap removes its components and their sketch in one go, and
       // puts back anything auto layout moved to make room for them.
       const gone = new Set(last.placedIds)
       if (!state.placed.some((p) => gone.has(p.id))) return { ...state, history }
-      const restore = new Map(last.moved.map((m) => [m.id, m.box]))
+      const restore = new Map(last.moved.map((m) => [m.id, m]))
       return {
         ...state,
         placed: state.placed
           .filter((p) => !gone.has(p.id))
-          .map((p) => (restore.has(p.id) ? { ...p, box: restore.get(p.id)! } : p)),
+          .map((p) => {
+            const m = restore.get(p.id)
+            return m ? { ...p, box: m.box, drawnBox: m.drawnBox ?? p.drawnBox } : p
+          }),
         history,
       }
     }
@@ -220,6 +432,37 @@ export function canvasReducer(state: CanvasState, action: CanvasAction): CanvasS
   }
 }
 
+/**
+ * What the most recent sketch, group or copy became, still on the canvas,
+ * outermost first. Phones come from the toolbar and aren't duplicated.
+ */
+function lastCreated(state: CanvasState): Placed[] {
+  for (let i = state.history.length - 1; i >= 0; i--) {
+    const h = state.history[i]
+    if (h.type !== 'swap') continue
+    const ids = new Set(h.placedIds)
+    const items = state.placed.filter((p) => ids.has(p.id) && p.kind !== 'phone')
+    if (!items.length) continue
+    // Only the outermost: anything inside another comes along as its content.
+    return items.filter((p) => !items.some((o) => descendantsOf(o, state.placed).includes(p)))
+  }
+  return []
+}
+
+/** Everything inside `item`, at any depth. */
+export function descendantsOf(item: Placed, placed: Placed[]): Placed[] {
+  const kids = placed.filter((p) => parentOf(p, placed) === item)
+  return kids.flatMap((k) => [k, ...descendantsOf(k, placed)])
+}
+
+/** The boxes, as they were, of everything an action moved. */
+function movedSince(before: Placed[], after: Placed[]): Moved[] {
+  const old = new Map(before.map((p) => [p.id, p]))
+  return after
+    .filter((p) => old.has(p.id) && (old.get(p.id)!.box !== p.box || old.get(p.id)!.drawnBox !== p.drawnBox))
+    .map((p) => ({ id: p.id, box: old.get(p.id)!.box, drawnBox: old.get(p.id)!.drawnBox }))
+}
+
 /** Starting a stroke this far from the open group closes the group right away. */
 export const GROUP_BREAK_DISTANCE = 48
 
@@ -227,6 +470,28 @@ export function startsNewGroup(pending: Stroke[], start: Point, gap = GROUP_BREA
   if (pending.length === 0) return false
   const box = unionBoxes(pending.map((s) => boundsOf(s.points)))
   return distanceToBox(start, box) > gap
+}
+
+/**
+ * What an X erases: everything mostly inside it, so one big X clears a whole
+ * form. An X too small to cover anything takes the topmost component where
+ * its strokes cross.
+ */
+export function crossedOut(placed: Placed[], strokes: Stroke[], crossing: Point): string[] {
+  const x = unionBoxes(strokes.map((s) => boundsOf(s.points)))
+  const covered = placed.filter((p) => overlapArea(p.box, x) >= COVERED * area(p.box))
+  if (covered.length) return covered.map((p) => p.id)
+  const under = placedAt(placed, crossing)
+  return under ? [under.id] : []
+}
+
+/** How much of a component an X must cover to erase it. */
+const COVERED = 0.5
+
+function overlapArea(a: Box, b: Box): number {
+  const w = Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x)
+  const h = Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y)
+  return w > 0 && h > 0 ? w * h : 0
 }
 
 /** The topmost placed component under a point, allowing `slack` px around its box. */

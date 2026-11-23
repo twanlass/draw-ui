@@ -9,7 +9,8 @@
     "lint": "eslint .",
     "preview": "vite preview",
     "test": "vitest run",
-    "feedback:replay": "node scripts/replay-feedback.mjs"
+    "feedback:replay": "node scripts/replay-feedback.mjs",
+    "eval:guards": "node scripts/eval-guards.mjs"
   },
   "dependencies": {
     "@base-ui/react": "^1.9.0",
