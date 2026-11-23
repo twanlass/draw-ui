@@ -1,0 +1,97 @@
+import { describe, expect, it, vi } from 'vitest'
+import { boxStroke, scrawl } from '@/test/sketch'
+import { imageSize, imageSizeProblem } from './decisions'
+import { layoutFor } from './rasterize'
+import { createJevRecognizer, toMatch } from './recognizer'
+
+const sketch = [boxStroke(100, 100, 140, 44), scrawl(145, 114, 50, 16)]
+const render = () => 'data:image/png;base64,AAAA'
+
+describe('Jev recognizer', () => {
+  it('swaps to the top component and keeps runners-up as alternatives', async () => {
+    const call = vi.fn().mockResolvedValue({
+      ranked: [
+        { kind: 'button', p: 0.9 },
+        { kind: 'badge', p: 0.3 },
+        { kind: 'toggle', p: 0.2 },
+      ],
+      ms: 210,
+      cost: 0.00002,
+    })
+    const match = await createJevRecognizer({ call, render })(sketch)
+    expect(match?.kind).toBe('button')
+    expect(match?.confidence).toBe(0.9)
+    expect(match?.alternatives?.map((a) => a.kind)).toEqual(['badge', 'toggle'])
+    // Snaps to the drawn frame, and sends the on-screen size.
+    expect(match?.box.w).toBeCloseTo(140, -1)
+    expect(call.mock.calls[0][0]).toMatchObject({ image: render() })
+    expect(call.mock.calls[0][0].width).toBeGreaterThan(130)
+  })
+
+  it('always goes with the top guess, however unsure', () => {
+    const unsure = toMatch([{ kind: 'switch', p: 0.08 }, { kind: 'input', p: 0.06 }], sketch)
+    expect(unsure).toMatchObject({ kind: 'switch', confidence: 0.08, alternatives: [{ kind: 'input', p: 0.06 }] })
+    expect(toMatch([], sketch)).toBeNull()
+  })
+
+  it('falls back to shape heuristics when Jev fails', async () => {
+    const call = vi.fn().mockRejectedValue(new Error('502'))
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const match = await createJevRecognizer({ call, render })(sketch)
+    expect(match?.kind).toBe('button')
+    warn.mockRestore()
+  })
+})
+
+describe('image layout', () => {
+  it('pads a tiny sketch out to 288px, so it clears the 78,400 pixel minimum', () => {
+    const l = layoutFor({ x: 0, y: 0, w: 20, h: 20 })
+    expect(Math.min(l.width, l.height)).toBe(288)
+  })
+
+  it.each([
+    [24, 24],
+    [20, 20],
+    [600, 2],
+    [2, 600],
+    [140, 44],
+    [4000, 1000],
+    [1000, 4000],
+    [5000, 5000],
+    [300, 200],
+  ])('produces an image Jev accepts for a %ix%i sketch', (w, h) => {
+    const l = layoutFor({ x: 0, y: 0, w, h })
+    expect(imageSizeProblem(l)).toBeNull()
+  })
+
+  it('scales a huge sketch down to the 1568px maximum', () => {
+    const l = layoutFor({ x: 0, y: 0, w: 4000, h: 1000 })
+    expect(l.width).toBeLessThanOrEqual(1568)
+    expect(l.height).toBeGreaterThanOrEqual(256)
+  })
+
+  it('pads a thin line out to the minimum side', () => {
+    const l = layoutFor({ x: 0, y: 0, w: 600, h: 2 })
+    expect(l.height).toBe(288)
+    expect(l.width).toBeLessThanOrEqual(1568)
+  })
+})
+
+describe('image layout keeps relative size', () => {
+  it('upscales a checkbox at most 2x, padding the rest', () => {
+    const l = layoutFor({ x: 0, y: 0, w: 24, h: 24 })
+    expect(l.scale).toBe(2)
+    expect(l.width).toBe(288)
+  })
+})
+
+describe('imageSize', () => {
+  it('reads width and height from a PNG header', async () => {
+    const { pngHeader } = await import('@/test/png')
+    expect(imageSize(pngHeader(288, 400))).toEqual({ width: 288, height: 400 })
+  })
+
+  it('flags 256x256 as too few pixels', () => {
+    expect(imageSizeProblem({ width: 256, height: 256 })).toContain('total pixels')
+  })
+})

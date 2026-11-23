@@ -22,3 +22,7 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Feedback reports from the app (see README)
+feedback
+recordings
