@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useReducer, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react'
 import {
   BugIcon,
   MousePointer2Icon,
@@ -11,6 +11,8 @@ import {
 } from 'lucide-react'
 import { toast } from 'sonner'
 import { svgInk } from '@/lib/freehand.js'
+import { Kbd, KbdGroup } from '@/components/ui/kbd'
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import { cn } from '@/lib/utils'
 import type { Point } from '@/lib/geometry'
 import { buildReport, sendFeedback } from '@/feedback/report'
@@ -21,8 +23,9 @@ import { splitLabel } from '@/recognize/split'
 import type { ComponentKind, Recognizer, Stroke } from '@/recognize/types'
 import { newPhoneBox } from './frames'
 import { idleDelay } from './idle'
+import { ComponentPalette } from './ComponentPalette'
 import { PlacedComponent } from './PlacedComponent'
-import { containerAt } from './layout'
+import { containerAt, gapAt, parentOf, type Gap } from './layout'
 import {
   canvasReducer,
   crossedOut,
@@ -72,6 +75,31 @@ export function SketchCanvas({
   const [mode, setMode] = useState<Mode>('draw')
   const modeRef = useRef(mode)
   modeRef.current = mode
+  /**
+   * The bottom toolbar stays out of the way: it shows for a moment when the
+   * mode changes (and on first load), while the pointer is near the bottom
+   * edge or over it, and while it has a note to show.
+   */
+  const [revealed, setRevealed] = useState(true)
+  const [nearBottom, setNearBottom] = useState(false)
+  const [overBar, setOverBar] = useState(false)
+  const revealTimer = useRef<number | undefined>(undefined)
+  const reveal = useCallback(() => {
+    setRevealed(true)
+    window.clearTimeout(revealTimer.current)
+    revealTimer.current = window.setTimeout(() => setRevealed(false), REVEAL_MS)
+  }, [])
+  useEffect(() => {
+    revealTimer.current = window.setTimeout(() => setRevealed(false), REVEAL_MS)
+    return () => window.clearTimeout(revealTimer.current)
+  }, [])
+  const changeMode = useCallback(
+    (next: Mode | ((m: Mode) => Mode)) => {
+      setMode(next)
+      reveal()
+    },
+    [reveal],
+  )
   /** The component under the pointer in edit mode. */
   const [hovered, setHovered] = useState<string>()
   /**
@@ -96,9 +124,31 @@ export function SketchCanvas({
   } | null>(null)
   const stateRef = useRef(state)
   const surfaceRef = useRef<HTMLDivElement>(null)
+  /**
+   * How far the view has scrolled over the canvas. Everything placed or drawn
+   * stays in canvas coordinates; only the view moves. Trackpad or wheel
+   * scrolling pans, and so does Space+drag or a middle-button drag.
+   */
+  const [pan, setPan] = useState<Point>({ x: 0, y: 0 })
+  const panRef = useRef(pan)
+  panRef.current = pan
+  const [spaceDown, setSpaceDown] = useState(false)
+  const panDrag = useRef<{ from: Point; pan: Point } | null>(null)
+  const [panning, setPanning] = useState(false)
+  /** Where canvas (0, 0) is on screen. */
+  const origin = () => {
+    const rect = surfaceRef.current!.getBoundingClientRect()
+    return { left: rect.left + panRef.current.x, top: rect.top + panRef.current.y }
+  }
   const idleTimer = useRef<number | undefined>(undefined)
   /** Where the pointer is over the canvas, for hover shortcuts (+/- on a label). */
   const hover = useRef<Point | null>(null)
+  /** The Cmd+K menu, and where on the canvas its pick goes (the pointer when it opened, or the middle of the view). */
+  const [palette, setPalette] = useState(false)
+  const paletteAt = useRef<Point>({ x: 0, y: 0 })
+  /** Edit mode: the gap between two components under the pointer (a blue line), and the one the open menu inserts into. */
+  const [gap, setGap] = useState<Gap | null>(null)
+  const [paletteGap, setPaletteGap] = useState<Gap | null>(null)
   /** A short note in the toolbar, like the text style a label just became. */
   const [flash, setFlash] = useState<string>()
   const flashTimer = useRef<number | undefined>(undefined)
@@ -162,6 +212,15 @@ export function SketchCanvas({
         e.preventDefault()
         window.clearTimeout(idleTimer.current)
         apply({ type: 'undo' })
+      } else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
+        e.preventDefault()
+        const rect = surfaceRef.current!.getBoundingClientRect()
+        paletteAt.current = hover.current ?? {
+          x: rect.width / 2 - panRef.current.x,
+          y: rect.height / 2 - panRef.current.y,
+        }
+        setPaletteGap(null)
+        setPalette(true)
       } else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'd') {
         // Not the browser's bookmark shortcut: copy the last component.
         e.preventDefault()
@@ -185,30 +244,104 @@ export function SketchCanvas({
         window.clearTimeout(flashTimer.current)
         flashTimer.current = window.setTimeout(() => setFlash(undefined), 1200)
       } else if (e.key.toLowerCase() === 'p' && !e.metaKey && !e.ctrlKey) {
-        setMode((m) => (m === 'interact' ? 'draw' : 'interact'))
+        changeMode((m) => (m === 'interact' ? 'draw' : 'interact'))
       } else if (e.key.toLowerCase() === 'e' && !e.metaKey && !e.ctrlKey) {
-        setMode((m) => (m === 'edit' ? 'draw' : 'edit'))
+        changeMode((m) => (m === 'edit' ? 'draw' : 'edit'))
       } else if (e.key.toLowerCase() === 'd' && !e.metaKey && !e.ctrlKey) {
-        setMode('draw')
+        changeMode('draw')
       }
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [apply])
+  }, [apply, changeMode])
 
-  const toPoint = (e: React.PointerEvent): Point => {
-    const rect = surfaceRef.current!.getBoundingClientRect()
+  // Pressing or releasing Cmd/Ctrl in edit mode switches the hover between a
+  // group and the component inside it.
+  useEffect(() => {
+    if (mode !== 'edit') return
+    const rehover = (e: KeyboardEvent) => {
+      if (e.key !== 'Meta' && e.key !== 'Control') return
+      const at = hover.current
+      if (!at || dragRef.current || gapAt(stateRef.current.placed, at)) return
+      setHovered(grabbableAt(stateRef.current.placed, at, e.type === 'keydown')?.id)
+    }
+    window.addEventListener('keydown', rehover)
+    window.addEventListener('keyup', rehover)
+    return () => {
+      window.removeEventListener('keydown', rehover)
+      window.removeEventListener('keyup', rehover)
+    }
+  }, [mode])
+
+  // Hold Space to pan by dragging.
+  useEffect(() => {
+    const typing = (e: KeyboardEvent) =>
+      e.target instanceof Element && !!e.target.closest('input, textarea, [contenteditable="true"]')
+    const down = (e: KeyboardEvent) => {
+      if (e.code !== 'Space' || typing(e)) return
+      e.preventDefault()
+      setSpaceDown(true)
+    }
+    const up = (e: KeyboardEvent) => e.code === 'Space' && setSpaceDown(false)
+    const blur = () => setSpaceDown(false)
+    window.addEventListener('keydown', down)
+    window.addEventListener('keyup', up)
+    window.addEventListener('blur', blur)
+    return () => {
+      window.removeEventListener('keydown', down)
+      window.removeEventListener('keyup', up)
+      window.removeEventListener('blur', blur)
+    }
+  }, [])
+
+  // Scrolling (two fingers on a trackpad, or the wheel; Shift for sideways)
+  // pans. Not passive, so a sideways swipe doesn't navigate back.
+  useEffect(() => {
+    const el = surfaceRef.current
+    if (!el) return
+    const onWheel = (e: WheelEvent) => {
+      // Pinch-zoom arrives as Ctrl+wheel: leave it to the browser.
+      if (e.ctrlKey) return
+      e.preventDefault()
+      const sideways = e.shiftKey && !e.deltaX
+      const dx = sideways ? e.deltaY : e.deltaX
+      const dy = sideways ? 0 : e.deltaY
+      setPan((p) => ({ x: p.x - dx, y: p.y - dy }))
+    }
+    el.addEventListener('wheel', onWheel, { passive: false })
+    return () => el.removeEventListener('wheel', onWheel)
+  }, [])
+
+  const toPoint = (e: { clientX: number; clientY: number; pressure?: number }): Point => {
+    const o = origin()
     return {
-      x: e.clientX - rect.left,
-      y: e.clientY - rect.top,
+      x: e.clientX - o.left,
+      y: e.clientY - o.top,
       z: e.pressure || 0.5,
     }
   }
 
   const onPointerDown = (e: React.PointerEvent) => {
+    if (e.button === 1 || (e.button === 0 && spaceDown)) {
+      e.preventDefault()
+      e.currentTarget.setPointerCapture(e.pointerId)
+      panDrag.current = { from: { x: e.clientX, y: e.clientY }, pan: panRef.current }
+      setPanning(true)
+      return
+    }
     if (mode === 'edit' && e.button === 0) {
       const start = toPoint(e)
-      const target = editableAt(stateRef.current.placed, start)
+      // Clicking the blue line between two components opens the menu to insert there.
+      const between = gapAt(stateRef.current.placed, start)
+      if (between) {
+        e.preventDefault()
+        paletteAt.current = { x: between.x + between.w / 2, y: between.y }
+        setPaletteGap(between)
+        setGap(null)
+        setPalette(true)
+        return
+      }
+      const target = grabbableAt(stateRef.current.placed, start, e.metaKey || e.ctrlKey)
       if (!target) return
       e.currentTarget.setPointerCapture(e.pointerId)
       const ids = new Set([target, ...descendantsOf(target, stateRef.current.placed)].map((p) => p.id))
@@ -234,7 +367,15 @@ export function SketchCanvas({
   }
 
   const onPointerMove = (e: React.PointerEvent) => {
+    const pd = panDrag.current
+    if (pd) {
+      setPan({ x: pd.pan.x + e.clientX - pd.from.x, y: pd.pan.y + e.clientY - pd.from.y })
+      return
+    }
     hover.current = toPoint(e)
+    // Near the bottom edge, and not mid-stroke or mid-drag, brings the toolbar up.
+    const rect = surfaceRef.current!.getBoundingClientRect()
+    setNearBottom(!live && !marquee && !dragRef.current && e.clientY - rect.top > rect.height - BOTTOM_ZONE)
     const d = dragRef.current
     if (d) {
       const at = hover.current
@@ -251,7 +392,12 @@ export function SketchCanvas({
         )
       return
     }
-    if (mode === 'edit') setHovered(editableAt(stateRef.current.placed, hover.current)?.id)
+    if (mode === 'edit') {
+      // Between two components: the insert line, not the component behind it.
+      const between = gapAt(stateRef.current.placed, hover.current)
+      setGap(between)
+      setHovered(between ? undefined : grabbableAt(stateRef.current.placed, hover.current, e.metaKey || e.ctrlKey)?.id)
+    }
     if (marquee) {
       const to = toPoint(e)
       setMarquee((m) => (m ? { ...m, to } : m))
@@ -263,6 +409,11 @@ export function SketchCanvas({
   }
 
   const onPointerUp = () => {
+    if (panDrag.current) {
+      panDrag.current = null
+      setPanning(false)
+      return
+    }
     const d = dragRef.current
     if (d) {
       dragRef.current = null
@@ -294,25 +445,28 @@ export function SketchCanvas({
     idleTimer.current = window.setTimeout(closeGroup, idleDelay(strokes.filter((s) => ids.has(s.id))))
   }
 
-  const highlight = state.placed.find((p) => p.id === hovered)?.box
+  // While dragging, show the canvas as it would be after the drop: the same
+  // move the drop applies, run on a copy, so everything else slides into
+  // place live. The dragged component itself follows the pointer.
+  const preview = useMemo(() => {
+    if (!drag?.active) return null
+    return canvasReducer(state, { type: 'move', id: drag.id, dx: drag.at.x - drag.start.x, dy: drag.at.y - drag.start.y, at: drag.at })
+  }, [drag, state])
+  const shown = preview?.placed ?? state.placed
+  const highlight = shown.find((p) => p.id === hovered)?.box
   const edited = editing && state.placed.find((p) => p.id === editing.id)
 
   // In edit mode, double-click a component's text to change it.
   const onDoubleClick = (e: React.MouseEvent) => {
     if (mode !== 'edit') return
-    const rect = surfaceRef.current!.getBoundingClientRect()
-    const target = editableAt(stateRef.current.placed, {
-      x: e.clientX - rect.left,
-      y: e.clientY - rect.top,
-    })
+    const target = editableAt(stateRef.current.placed, toPoint(e))
     if (target && hasText(target)) openEditor(target)
   }
 
   // Open the in-place editor on a component's text.
   const openEditor = (target: Placed) => {
-    const rect = surfaceRef.current!.getBoundingClientRect()
     const el = surfaceRef.current!.querySelector(`[data-id="${target.id}"]`)
-    const shown = el ? shownText(el, rect) : undefined
+    const shown = el ? shownText(el, origin()) : undefined
     // Hide the text being edited while the editor sits on top of it.
     shown?.host.setAttribute('data-editing-text', '')
     setEditing({
@@ -335,9 +489,26 @@ export function SketchCanvas({
         ref={surfaceRef}
         data-testid="surface"
         // No text selection while drawing: a stroke across a label shouldn't select it.
-        className={cn('absolute inset-0 touch-none', mode !== 'interact' && 'select-none')}
+        className={cn('absolute inset-0 touch-none overscroll-none', mode !== 'interact' && 'select-none')}
         style={{
-          cursor: draws(mode) ? 'crosshair' : drag?.active ? 'grabbing' : mode === 'edit' && hovered ? 'grab' : 'default',
+          cursor: panning
+            ? 'grabbing'
+            : spaceDown
+              ? 'grab'
+              : draws(mode)
+                ? 'crosshair'
+                : drag?.active
+                  ? 'grabbing'
+                  : mode === 'edit' && gap
+                    ? 'pointer'
+                    : mode === 'edit' && hovered
+                      ? 'grab'
+                    : 'default',
+          // A faint dot grid that moves with the canvas, so panning shows.
+          // Interact mode previews the real UI, so no grid there.
+          backgroundImage: mode === 'interact' ? undefined : 'radial-gradient(circle, var(--border) 1px, transparent 1.2px)',
+          backgroundSize: `${GRID}px ${GRID}px`,
+          backgroundPosition: `${pan.x}px ${pan.y}px`,
         }}
         onPointerDown={onPointerDown}
         onPointerMove={onPointerMove}
@@ -347,99 +518,111 @@ export function SketchCanvas({
         onPointerLeave={() => {
           hover.current = null
           setHovered(undefined)
+          setGap(null)
+          setNearBottom(false)
         }}
       >
-        <div
-          // Groups have no look of their own. Outline one as it's made so you
-          // see what got grouped, then fade it after a moment in draw mode;
-          // debug keeps every outline.
-          className={cn(
-            mode !== 'interact' &&
-              'pointer-events-none [&_[data-kind=group]]:outline-1 [&_[data-kind=group]]:outline-dashed [&_[data-kind=group]]:outline-sky-500/40',
-            mode === 'draw' && '[&_[data-kind=group]]:animate-[group-outline-fade_300ms_ease-out_500ms_forwards]',
-          )}
-        >
-          {mode === 'edit' && highlight && (
-            // Behind the component, a little larger, so it shows around opaque ones like cards.
-            <div
-              data-testid="hover-highlight"
-              className="absolute rounded-md bg-sky-500/10 transition-all duration-100"
-              style={{
-                left: highlight.x - 4,
-                top: highlight.y - 4,
-                width: highlight.w + 8,
-                height: highlight.h + 8,
-              }}
-            />
-          )}
-          {state.placed.map((p) => (
-            <PlacedComponent
-              key={p.id}
-              placed={p}
-              chip={mode === 'debug'}
-              offset={
-                drag?.active && drag.ids.has(p.id) ? { x: drag.at.x - drag.start.x, y: drag.at.y - drag.start.y } : undefined
-              }
-              onReassign={(kind) => {
-                if (mode === 'debug') {
-                  // The correction is the feedback: report the guess as it was.
-                  const report = buildReport(p, stateRef.current.placed, kind, engine)
-                  sendFeedback(report).then(
-                    (id) =>
-                      toast('Feedback saved', {
-                        description: `${report.note} · ${id}`,
-                      }),
-                    (err) =>
-                      toast.error('Feedback not saved', {
-                        description: (err as Error).message,
-                      }),
-                  )
-                }
-                apply({ type: 'reassign', id: p.id, kind })
-              }}
-            />
-          ))}
-        </div>
-        <svg data-testid="ink" className="pointer-events-none absolute inset-0 size-full fill-foreground/70">
-          {state.strokes.map((s) => (
-            <path
-              key={s.id}
-              d={svgInk(s.points, { ...INK, last: true })}
-              className={recognizing.has(s.id) ? 'animate-pulse' : undefined}
-            />
-          ))}
-          {live && <path d={svgInk(live, INK)} />}
-        </svg>
-        {mode === 'edit' && editing && edited && (
-          <TextEditor
-            key={editing.id}
-            initial={editing.text}
-            style={editing.style}
-            onDone={(text, step) => {
-              editing.host?.removeAttribute('data-editing-text')
-              setEditing(null)
-              if (text !== null) apply({ type: 'setText', id: editing.id, text })
-              // Tab / Shift+Tab: on to the next (or previous) text in reading order.
-              if (step) {
-                const order = readingOrder(stateRef.current.placed.filter(hasText))
-                const next = order[order.findIndex((p) => p.id === editing.id) + step]
-                if (next) openEditor(next)
-              }
-            }}
-          />
-        )}
-        {marquee && (
+        <div data-testid="world" className="absolute inset-0" style={{ transform: `translate(${pan.x}px, ${pan.y}px)` }}>
           <div
-            data-testid="marquee"
-            className="pointer-events-none absolute border border-sky-500 bg-sky-500/5"
-            style={(({ x, y, w, h }) => ({
-              left: x,
-              top: y,
-              width: w,
-              height: h,
-            }))(rectOf(marquee))}
-          />
-        )}
+            // Groups have no look of their own. Outline one as it's made so you
+            // see what got grouped, then fade it after a moment in draw mode;
+            // debug keeps every outline.
+            className={cn(
+              mode !== 'interact' &&
+                'pointer-events-none [&_[data-kind=group]]:outline-1 [&_[data-kind=group]]:outline-dashed [&_[data-kind=group]]:outline-sky-500/40',
+              mode === 'draw' && '[&_[data-kind=group]]:animate-[group-outline-fade_300ms_ease-out_500ms_forwards]',
+            )}
+          >
+            {mode === 'edit' && highlight && (
+              // Behind the component, a little larger, so it shows around opaque ones like cards.
+              <div
+                data-testid="hover-highlight"
+                className="absolute rounded-md bg-sky-500/10 transition-all duration-100"
+                style={{
+                  left: highlight.x - 4,
+                  top: highlight.y - 4,
+                  width: highlight.w + 8,
+                  height: highlight.h + 8,
+                }}
+              />
+            )}
+            {shown.map((p) => (
+              <PlacedComponent
+                key={p.id}
+                placed={drag?.active && drag.ids.has(p.id) ? (state.placed.find((q) => q.id === p.id) ?? p) : p}
+                chip={mode === 'debug'}
+                offset={
+                  drag?.active && drag.ids.has(p.id) ? { x: drag.at.x - drag.start.x, y: drag.at.y - drag.start.y } : undefined
+                }
+                onReassign={(kind) => {
+                  if (mode === 'debug') {
+                    // The correction is the feedback: report the guess as it was.
+                    const report = buildReport(p, stateRef.current.placed, kind, engine)
+                    sendFeedback(report).then(
+                      (id) =>
+                        toast('Feedback saved', {
+                          description: `${report.note} · ${id}`,
+                        }),
+                      (err) =>
+                        toast.error('Feedback not saved', {
+                          description: (err as Error).message,
+                        }),
+                    )
+                  }
+                  apply({ type: 'reassign', id: p.id, kind })
+                }}
+              />
+            ))}
+          </div>
+          {mode === 'edit' && (palette ? paletteGap : gap) && (
+            // Where a component would be inserted; stays up while the menu is open.
+            <div
+              data-testid="insert-line"
+              className="pointer-events-none absolute z-40 h-0.5 rounded-full bg-blue-500"
+              style={lineStyle((palette ? paletteGap : gap)!)}
+            />
+          )}
+          <svg data-testid="ink" className="pointer-events-none absolute inset-0 size-full overflow-visible fill-foreground/70">
+            {state.strokes.map((s) => (
+              <path
+                key={s.id}
+                d={svgInk(s.points, { ...INK, last: true })}
+                className={recognizing.has(s.id) ? 'animate-pulse' : undefined}
+              />
+            ))}
+            {live && <path d={svgInk(live, INK)} />}
+          </svg>
+          {mode === 'edit' && editing && edited && (
+            <TextEditor
+              key={editing.id}
+              initial={editing.text}
+              style={editing.style}
+              onDone={(text, step) => {
+                editing.host?.removeAttribute('data-editing-text')
+                setEditing(null)
+                if (text !== null) apply({ type: 'setText', id: editing.id, text })
+                // Tab / Shift+Tab: on to the next (or previous) text in reading order.
+                if (step) {
+                  const order = readingOrder(stateRef.current.placed.filter(hasText))
+                  const next = order[order.findIndex((p) => p.id === editing.id) + step]
+                  if (next) openEditor(next)
+                }
+              }}
+            />
+          )}
+          {marquee && (
+            <div
+              data-testid="marquee"
+              className="pointer-events-none absolute border border-sky-500 bg-sky-500/5"
+              style={(({ x, y, w, h }) => ({
+                left: x,
+                top: y,
+                width: w,
+                height: h,
+              }))(rectOf(marquee))}
+            />
+          )}
+        </div>
       </div>
 
       {showPhone && (
@@ -447,7 +630,8 @@ export function SketchCanvas({
           onAddPhone={() => {
             const rect = surfaceRef.current!.getBoundingClientRect()
             const phones = stateRef.current.placed.filter((p) => p.kind === 'phone').map((p) => p.box)
-            const box = newPhoneBox(phones, { w: rect.width, h: rect.height })
+            const inView = newPhoneBox(phones, { w: rect.width, h: rect.height })
+            const box = { ...inView, x: inView.x - panRef.current.x, y: inView.y - panRef.current.y }
             apply({
               type: 'add',
               placed: {
@@ -463,9 +647,23 @@ export function SketchCanvas({
           }}
         />
       )}
+      <ComponentPalette
+        open={palette}
+        onOpenChange={(open) => {
+          setPalette(open)
+          if (!open) setPaletteGap(null)
+        }}
+        onPick={(kind) => {
+          setPalette(false)
+          setPaletteGap(null)
+          apply({ type: 'insert', id: newId('placed'), kind, at: paletteAt.current, gap: paletteGap ?? undefined })
+        }}
+      />
       <Toolbar
         mode={mode}
-        onMode={setMode}
+        onMode={changeMode}
+        visible={revealed || nearBottom || overBar || flash !== undefined}
+        onHover={setOverBar}
         showDebug={showDebug}
         onUndo={() => apply({ type: 'undo' })}
         onClear={() => {
@@ -517,7 +715,10 @@ function readingOrder(placed: Placed[]): Placed[] {
  * The text a component shows (its placeholder, if it's a field), the element
  * it's drawn in, and that element's look, so an editor can sit exactly on top.
  */
-function shownText(el: Element, origin: DOMRect): { text: string; host: HTMLElement; style: React.CSSProperties } | undefined {
+function shownText(
+  el: Element,
+  origin: { left: number; top: number },
+): { text: string; host: HTMLElement; style: React.CSSProperties } | undefined {
   const field = el.querySelector('input, textarea') as HTMLInputElement | null
   const select = el.querySelector('select')
   let text: string | undefined
@@ -537,6 +738,31 @@ function shownText(el: Element, origin: DOMRect): { text: string; host: HTMLElem
   const centred = css.display.includes('flex') && css.justifyContent === 'center'
   // A placeholder is drawn in the placeholder colour.
   const color = host === field ? getComputedStyle(field, '::placeholder').color || css.color : css.color
+  // The editor is one line, and an input centres its line vertically. A
+  // textarea's text starts at the top, so cover just its first line there.
+  if (host instanceof HTMLTextAreaElement) {
+    const px = (v: string) => parseFloat(v) || 0
+    const line = px(css.lineHeight) || px(css.fontSize) * 1.5
+    return {
+      text,
+      host,
+      style: {
+        left: r.left - origin.left,
+        top: r.top - origin.top + px(css.borderTopWidth) + px(css.paddingTop),
+        width: r.width,
+        height: line,
+        font: css.font,
+        lineHeight: `${line}px`,
+        color,
+        letterSpacing: css.letterSpacing,
+        textAlign: css.textAlign as React.CSSProperties['textAlign'],
+        padding: `0 ${css.paddingRight} 0 ${css.paddingLeft}`,
+        borderStyle: 'solid',
+        borderColor: 'transparent',
+        borderWidth: `0 ${css.borderRightWidth} 0 ${css.borderLeftWidth}`,
+      },
+    }
+  }
   return {
     text,
     host,
@@ -602,6 +828,19 @@ function TextEditor({
 }
 
 /** The component a hover or edit key acts on: the topmost one under the point, not a phone. */
+/**
+ * What a press or hover in edit mode picks up. Something in a group picks
+ * up the (outermost) group, since a group is one unit; with Cmd/Ctrl held it's
+ * the component itself.
+ */
+function grabbableAt(placed: Placed[], p: Point, deep: boolean) {
+  const hit = editableAt(placed, p)
+  if (!hit || deep) return hit
+  let top = hit
+  for (let up = parentOf(top, placed); up?.kind === 'group'; up = parentOf(up, placed)) top = up
+  return top
+}
+
 function editableAt(placed: Placed[], p: Point) {
   return placedAt(
     placed.filter((x) => x.kind !== 'phone'),
@@ -623,17 +862,23 @@ function rectOf({ from, to }: { from: Point; to: Point }) {
 function SideToolbar({ onAddPhone }: { onAddPhone: () => void }) {
   return (
     <div className="absolute left-4 top-1/2 flex -translate-y-1/2 flex-col gap-1 rounded-lg border bg-background p-1 shadow-sm">
-      <button
-        className="rounded-md p-2 hover:bg-accent"
-        onClick={onAddPhone}
-        title="Add a phone frame"
-        aria-label="Add a phone frame"
-      >
-        <SmartphoneIcon className="size-4" />
-      </button>
+      <TooltipProvider delayDuration={300}>
+        <ToolButton label="Add a phone frame" side="right" className="rounded-md p-2 hover:bg-accent" onClick={onAddPhone}>
+          <SmartphoneIcon className="size-4" />
+        </ToolButton>
+      </TooltipProvider>
     </div>
   )
 }
+
+const lineStyle = ({ x, y, w }: Gap): React.CSSProperties => ({ left: x, top: y - 1, width: w })
+
+/** Spacing of the background dot grid. */
+const GRID = 24
+/** How long the toolbar stays up after a mode change. */
+const REVEAL_MS = 1500
+/** The pointer this close to the bottom edge (not drawing) brings the toolbar up. */
+const BOTTOM_ZONE = 96
 
 const MODES: { mode: Mode; label: string; key?: string; Icon: LucideIcon }[] = [
   { mode: 'draw', label: 'Draw', key: 'D', Icon: PencilIcon },
@@ -645,36 +890,77 @@ const MODES: { mode: Mode; label: string; key?: string; Icon: LucideIcon }[] = [
 function Toolbar(props: {
   mode: Mode
   onMode: (mode: Mode) => void
+  visible: boolean
+  onHover: (over: boolean) => void
   showDebug: boolean
   onUndo: () => void
   onClear: () => void
   canUndo: boolean
   status?: string
 }) {
-  // Icon buttons, named by aria-label and title for screen readers and hover.
   const btn = 'rounded-md p-2 hover:bg-accent disabled:opacity-40 disabled:hover:bg-transparent'
   return (
-    <div className="absolute bottom-4 left-1/2 flex -translate-x-1/2 items-center gap-1 rounded-lg border bg-background p-1 shadow-sm">
-      {MODES.filter((m) => m.mode !== 'debug' || props.showDebug).map(({ mode, label, key, Icon }) => (
-        <button
-          key={mode}
-          className={cn(btn, props.mode === mode && 'bg-accent')}
-          aria-pressed={props.mode === mode}
-          aria-label={label}
-          onClick={() => props.onMode(mode)}
-          title={key ? `${label} (${key})` : label}
-        >
-          <Icon className="size-4" />
+    <TooltipProvider delayDuration={300}>
+      <div
+        data-testid="toolbar"
+        data-visible={props.visible}
+        onPointerEnter={() => props.onHover(true)}
+        onPointerLeave={() => props.onHover(false)}
+        className={cn(
+          'absolute bottom-4 left-1/2 flex -translate-x-1/2 items-center gap-1 rounded-lg border bg-background p-1 shadow-sm transition-all duration-200',
+          !props.visible && 'pointer-events-none translate-y-3 opacity-0',
+        )}
+      >
+        {MODES.filter((m) => m.mode !== 'debug' || props.showDebug).map(({ mode, label, key, Icon }) => (
+          <ToolButton
+            key={mode}
+            label={label}
+            keys={key ? [key] : undefined}
+            className={cn(btn, props.mode === mode && 'bg-accent')}
+            aria-pressed={props.mode === mode}
+            onClick={() => props.onMode(mode)}
+          >
+            <Icon className="size-4" />
+          </ToolButton>
+        ))}
+        <span className="mx-1 h-5 w-px bg-border" />
+        <ToolButton label="Undo" keys={['⌘', 'Z']} className={btn} onClick={props.onUndo} disabled={!props.canUndo}>
+          <Undo2Icon className="size-4" />
+        </ToolButton>
+        <ToolButton label="Clear" className={btn} onClick={props.onClear}>
+          <Trash2Icon className="size-4" />
+        </ToolButton>
+        {props.status && <span className="px-2 text-xs text-muted-foreground">{props.status}</span>}
+      </div>
+    </TooltipProvider>
+  )
+}
+
+/** An icon button with a tooltip naming it and its shortcut; the label is also its accessible name. */
+function ToolButton({
+  label,
+  keys,
+  side = 'top',
+  children,
+  ...button
+}: { label: string; keys?: string[]; side?: 'top' | 'right' } & React.ComponentProps<'button'>) {
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <button type="button" aria-label={label} {...button}>
+          {children}
         </button>
-      ))}
-      <span className="mx-1 h-5 w-px bg-border" />
-      <button className={btn} onClick={props.onUndo} disabled={!props.canUndo} aria-label="Undo" title="Undo (Cmd/Ctrl+Z)">
-        <Undo2Icon className="size-4" />
-      </button>
-      <button className={btn} onClick={props.onClear} aria-label="Clear" title="Clear">
-        <Trash2Icon className="size-4" />
-      </button>
-      {props.status && <span className="px-2 text-xs text-muted-foreground">{props.status}</span>}
-    </div>
+      </TooltipTrigger>
+      <TooltipContent side={side} sideOffset={6} className="flex items-center gap-2">
+        {label}
+        {keys && (
+          <KbdGroup>
+            {keys.map((k) => (
+              <Kbd key={k}>{k}</Kbd>
+            ))}
+          </KbdGroup>
+        )}
+      </TooltipContent>
+    </Tooltip>
   )
 }

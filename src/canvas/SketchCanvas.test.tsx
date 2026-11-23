@@ -217,11 +217,12 @@ describe('SketchCanvas', () => {
     await (await drag({ x: 172, y: 123 }))()
     expect(el().style.cssText).toBe(before)
 
+    const [left, top] = [parseFloat(el().style.left), parseFloat(el().style.top)]
     const drop = await drag({ x: 470, y: 422 })
     // Follows the pointer while dragging, then lands there.
-    expect(el().style.transform).toBe('translate(300px, 300px)')
+    expect(parseFloat(el().style.left)).toBe(left + 300)
+    expect(parseFloat(el().style.top)).toBe(top + 300)
     await drop()
-    expect(el().style.transform).toBe('')
     expect(parseFloat(el().style.left)).toBeGreaterThan(300)
     expect(parseFloat(el().style.top)).toBeGreaterThan(300)
 
@@ -237,6 +238,111 @@ describe('SketchCanvas', () => {
     expect(queryByLabelText('Draw')).not.toBeNull()
     unmount()
     expect(render(<SketchCanvas showDebug />).queryByLabelText('Debug')).not.toBeNull()
+  })
+
+  it('pans the canvas by scrolling and Space+drag, drawing in canvas coordinates', async () => {
+    const recognizer = vi.fn(async (strokes: { points: Point[] }[]) => {
+      const xs = strokes.flatMap((s) => s.points.map((p) => p.x))
+      const ys = strokes.flatMap((s) => s.points.map((p) => p.y))
+      const x = Math.min(...xs)
+      const y = Math.min(...ys)
+      return { kind: 'button' as const, box: { x, y, w: Math.max(...xs) - x, h: Math.max(...ys) - y }, confidence: 1 }
+    })
+    const { getByTestId, container } = render(<SketchCanvas recognizer={recognizer} />)
+    const surface = getByTestId('surface')
+    const world = () => getByTestId('world').style.transform
+
+    fireEvent.wheel(surface, { deltaX: 30, deltaY: 200 })
+    expect(world()).toBe('translate(-30px, -200px)')
+
+    // Space+drag pans too, and doesn't draw.
+    fireEvent.keyDown(window, { code: 'Space', key: ' ' })
+    draw(surface, [{ x: 100, y: 100, z: 0.5 }, { x: 130, y: 150, z: 0.5 }])
+    fireEvent.keyUp(window, { code: 'Space', key: ' ' })
+    expect(world()).toBe('translate(0px, -150px)')
+    expect(container.querySelectorAll('[data-testid=ink] path')).toHaveLength(0)
+
+    // A sketch drawn at screen (100, 100) lands at canvas (100, 250).
+    const sketch = boxStroke(100, 100, 140, 44).points
+    draw(surface, sketch)
+    await act(async () => {
+      vi.advanceTimersByTime(MAX_IDLE_MS)
+    })
+    const drawn = recognizer.mock.calls[0][0][0].points[0]
+    expect(drawn.x).toBeCloseTo(sketch[0].x)
+    expect(drawn.y).toBeCloseTo(sketch[0].y + 150)
+  })
+
+  it('Cmd+K searches the components and Enter adds the highlighted one', async () => {
+    // cmdk measures and scrolls its list, which jsdom can't.
+    vi.stubGlobal(
+      'ResizeObserver',
+      class {
+        observe() {}
+        unobserve() {}
+        disconnect() {}
+      },
+    )
+    Element.prototype.scrollIntoView = () => {}
+    const { getByPlaceholderText, queryByPlaceholderText, container } = render(<SketchCanvas />)
+    await act(async () => {
+      fireEvent.keyDown(window, { key: 'k', metaKey: true })
+    })
+    const search = getByPlaceholderText('Add a component…')
+    await act(async () => {
+      fireEvent.change(search, { target: { value: 'textar' } })
+    })
+    await act(async () => {
+      fireEvent.keyDown(search, { key: 'Enter' })
+    })
+    expect(queryByPlaceholderText('Add a component…')).toBeNull()
+    expect([...container.querySelectorAll('[data-kind]')].map((e) => (e as HTMLElement).dataset.kind)).toEqual(['textarea'])
+    vi.unstubAllGlobals()
+  })
+
+  it('keeps the toolbar hidden except after a mode change or with the pointer near the bottom', async () => {
+    const { getByTestId } = render(<SketchCanvas />)
+    const bar = () => getByTestId('toolbar').dataset.visible
+    // Up on first load, then out of the way.
+    expect(bar()).toBe('true')
+    await act(async () => {
+      vi.advanceTimersByTime(1600)
+    })
+    expect(bar()).toBe('false')
+
+    await act(async () => {
+      fireEvent.keyDown(window, { key: 'e' })
+    })
+    expect(bar()).toBe('true')
+    await act(async () => {
+      vi.advanceTimersByTime(1600)
+    })
+    expect(bar()).toBe('false')
+
+    // jsdom gives the surface no size, so anywhere is "near the bottom".
+    fireEvent.pointerMove(getByTestId('surface'), { clientX: 10, clientY: 10 })
+    expect(bar()).toBe('true')
+    fireEvent.pointerLeave(getByTestId('surface'))
+    expect(bar()).toBe('false')
+  })
+
+  it('names toolbar buttons and their shortcuts in tooltips', async () => {
+    // Radix positions tooltips with ResizeObserver, which jsdom doesn't have.
+    vi.stubGlobal(
+      'ResizeObserver',
+      class {
+        observe() {}
+        unobserve() {}
+        disconnect() {}
+      },
+    )
+    const { getByLabelText, getByRole } = render(<SketchCanvas />)
+    await act(async () => {
+      getByLabelText('Edit').focus()
+      vi.advanceTimersByTime(500)
+    })
+    expect(getByRole('tooltip').textContent).toBe('EditE')
+    vi.unstubAllGlobals()
   })
 
   it('closes the open group when the next stroke starts far away', async () => {

@@ -37,12 +37,13 @@ export function PlacedComponent({
         chip && !isFrame(kind) && 'hover:z-30 has-[[data-chip-open]]:z-40',
         offset && 'z-50 opacity-80 shadow-lg transition-none',
       )}
+      // Dragged, it sits at the pointer with no easing; dropped, it eases from
+      // there into wherever layout puts it.
       style={{
-        left: box.x,
-        top: box.y,
+        left: box.x + (offset?.x ?? 0),
+        top: box.y + (offset?.y ?? 0),
         width: box.w,
         height: box.h,
-        transform: offset ? `translate(${offset.x}px, ${offset.y}px)` : undefined,
       }}
     >
       <RenderBoundary key={kind} kind={kind}>

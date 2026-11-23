@@ -10,7 +10,8 @@
     "preview": "vite preview",
     "test": "vitest run",
     "feedback:replay": "node scripts/replay-feedback.mjs",
-    "eval:guards": "node scripts/eval-guards.mjs"
+    "eval:guards": "node scripts/eval-guards.mjs",
+    "demo": "node scripts/demo.mjs"
   },
   "dependencies": {
     "@base-ui/react": "^1.9.0",
@@ -48,6 +49,7 @@
     "eslint-plugin-react-refresh": "^0.4.19",
     "globals": "^16.0.0",
     "jsdom": "^26.1.0",
+    "playwright": "^1.65.1",
     "typescript": "~5.8.3",
     "typescript-eslint": "^8.30.1",
     "vite": "^6.3.5",
