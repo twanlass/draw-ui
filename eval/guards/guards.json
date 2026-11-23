@@ -1,0 +1,137 @@
+{
+  "spinner-arrow": {
+    "expected": "spinner",
+    "w": 60,
+    "h": 60
+  },
+  "spinner-arc": {
+    "expected": "spinner",
+    "w": 56,
+    "h": 56
+  },
+  "spinner-spokes": {
+    "expected": "spinner",
+    "w": 56,
+    "h": 56
+  },
+  "card-big": {
+    "expected": "card",
+    "w": 380,
+    "h": 260
+  },
+  "card-mid": {
+    "expected": "card",
+    "w": 300,
+    "h": 200
+  },
+  "input-box": {
+    "expected": "input",
+    "w": 220,
+    "h": 40
+  },
+  "sonner": {
+    "expected": "sonner",
+    "w": 300,
+    "h": 80
+  },
+  "input-text-left": {
+    "expected": "input",
+    "w": 240,
+    "h": 40
+  },
+  "button-line": {
+    "expected": "button",
+    "w": 110,
+    "h": 40
+  },
+  "checkbox-empty": {
+    "expected": "checkbox",
+    "w": 24,
+    "h": 24
+  },
+  "checkbox-checked": {
+    "expected": "checkbox",
+    "w": 26,
+    "h": 26
+  },
+  "button-small": {
+    "expected": "button",
+    "w": 72,
+    "h": 32
+  },
+  "resizable": {
+    "expected": "resizable",
+    "w": 320,
+    "h": 200
+  },
+  "checkbox-label": {
+    "expected": "checkbox",
+    "w": 200,
+    "h": 26
+  },
+  "search-box": {
+    "expected": "input-group",
+    "w": 260,
+    "h": 40
+  },
+  "button-wide": {
+    "expected": "button",
+    "w": 600,
+    "h": 48
+  },
+  "button-full": {
+    "expected": "button",
+    "w": 850,
+    "h": 56
+  },
+  "button-wide-word": {
+    "expected": "button",
+    "w": 400,
+    "h": 44
+  },
+  "input-long-line": {
+    "expected": "input",
+    "w": 600,
+    "h": 44
+  },
+  "input-wide-left": {
+    "expected": "input",
+    "w": 600,
+    "h": 44
+  },
+  "input-wide-empty": {
+    "expected": "input",
+    "w": 700,
+    "h": 44
+  },
+  "label-line-short": {
+    "expected": "label",
+    "w": 70,
+    "h": 4
+  },
+  "label-line": {
+    "expected": "label",
+    "w": 130,
+    "h": 4
+  },
+  "label-squiggle": {
+    "expected": "label",
+    "w": 120,
+    "h": 14
+  },
+  "label-two-words": {
+    "expected": "label",
+    "w": 150,
+    "h": 14
+  },
+  "separator-long": {
+    "expected": "separator",
+    "w": 500,
+    "h": 4
+  },
+  "separator-vert": {
+    "expected": "separator",
+    "w": 4,
+    "h": 220
+  }
+}

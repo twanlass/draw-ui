@@ -154,11 +154,23 @@ import { Toggle } from '@/components/ui/toggle'
 import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import type { Box } from '@/lib/geometry'
+import { cn } from '@/lib/utils'
 import { PHONE_BEZEL, type PlacedKind } from './frames'
+import { textStyleInfo, type TextStyle } from './textStyles'
 
 export interface RenderProps {
   box: Box
   label?: string
+  /** For a label: which kind of text. */
+  textStyle?: TextStyle
+}
+
+/** How each kind of text looks; line heights match textStyles.ts so layout fits them. */
+const TEXT_CLASS: Record<Exclude<TextStyle, 'label'>, string> = {
+  help: 'text-xs leading-4 text-muted-foreground',
+  body: 'text-base leading-6',
+  subtitle: 'text-lg leading-7 text-muted-foreground',
+  title: 'text-2xl leading-8 font-semibold tracking-tight',
 }
 
 const isWide = (b: Box) => b.w >= b.h
@@ -327,9 +339,9 @@ export const renderers: Record<PlacedKind, (p: RenderProps) => ReactNode> = {
       </CollapsibleContent>
     </Collapsible>
   ),
-  combobox: () => (
+  combobox: ({ label }) => (
     <Combobox items={['Next.js', 'Remix', 'Astro']}>
-      <ComboboxInput placeholder="Select framework..." className="w-full" />
+      <ComboboxInput placeholder={label ?? 'Select framework...'} className="w-full" />
       <ComboboxContent>
         <ComboboxList>
           {(item: string) => (
@@ -440,9 +452,9 @@ export const renderers: Record<PlacedKind, (p: RenderProps) => ReactNode> = {
     </HoverCard>
   ),
   input: ({ label }) => <Input className="w-full" placeholder={label ?? 'Input'} />,
-  'input-group': () => (
+  'input-group': ({ label }) => (
     <InputGroup className="w-full">
-      <InputGroupInput placeholder="Search..." />
+      <InputGroupInput placeholder={label ?? 'Search...'} />
       <InputGroupAddon>
         <SearchIcon />
       </InputGroupAddon>
@@ -479,7 +491,12 @@ export const renderers: Record<PlacedKind, (p: RenderProps) => ReactNode> = {
       <Kbd>K</Kbd>
     </KbdGroup>
   ),
-  label: ({ label }) => <Label className="w-full">{label ?? 'Label'}</Label>,
+  label: ({ label, textStyle = 'label' }) =>
+    textStyle === 'label' ? (
+      <Label className="w-full">{label ?? 'Label'}</Label>
+    ) : (
+      <p className={cn('w-full truncate', TEXT_CLASS[textStyle])}>{label ?? textStyleInfo(textStyle).placeholder}</p>
+    ),
   marker: () => (
     <Marker>
       <MarkerContent>1</MarkerContent>
@@ -525,9 +542,9 @@ export const renderers: Record<PlacedKind, (p: RenderProps) => ReactNode> = {
       </MessageScroller>
     </MessageScrollerProvider>
   ),
-  'native-select': () => (
+  'native-select': ({ label }) => (
     <NativeSelect className="w-full">
-      <NativeSelectOption value="">Select a fruit</NativeSelectOption>
+      <NativeSelectOption value="">{label ?? 'Select a fruit'}</NativeSelectOption>
       <NativeSelectOption value="apple">Apple</NativeSelectOption>
     </NativeSelect>
   ),

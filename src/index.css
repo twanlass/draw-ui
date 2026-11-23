@@ -79,3 +79,16 @@
     @apply bg-background text-foreground;
   }
 }
+
+/* A group's dashed outline shows as it's made, then fades (see SketchCanvas). */
+@keyframes group-outline-fade {
+  to {
+    outline-color: transparent;
+  }
+}
+
+/* Text being edited in place: hidden while the editor sits exactly on top of it. */
+[data-editing-text],
+[data-editing-text]::placeholder {
+  color: transparent !important;
+}

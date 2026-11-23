@@ -1,4 +1,4 @@
-import { act, fireEvent, render } from '@testing-library/react'
+import { act, cleanup, fireEvent, render } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { Point } from '@/lib/geometry'
 import { boxStroke, scrawl } from '@/test/sketch'
@@ -37,6 +37,206 @@ describe('SketchCanvas', () => {
     })
     expect(container.querySelector('[data-kind]')).toBeNull()
     expect(container.querySelectorAll('[data-testid="ink"] path')).toHaveLength(0)
+  })
+
+  it('Cmd+D duplicates the last component and stays out of the browser shortcut', async () => {
+    const { getByTestId, container } = render(<SketchCanvas />)
+    draw(getByTestId('surface'), boxStroke(100, 100, 140, 44).points)
+    draw(getByTestId('surface'), scrawl(145, 114, 50, 16).points)
+    await act(async () => {
+      vi.advanceTimersByTime(MAX_IDLE_MS)
+    })
+    let notPrevented = true
+    await act(async () => {
+      notPrevented = fireEvent.keyDown(window, { key: 'd', metaKey: true })
+    })
+    expect(notPrevented).toBe(false)
+    expect(container.querySelectorAll('[data-kind="button"]')).toHaveLength(2)
+    // Still in draw mode: Cmd+D isn't the D debug toggle.
+    expect(container.querySelector('button[aria-pressed="true"]')?.getAttribute('aria-label')).toBe('Draw')
+  })
+
+  it('in edit mode, highlights what is hovered and steps a label through text styles with + and -', async () => {
+    const asLabel = async (strokes: { points: { x: number; y: number }[] }[]) => {
+      const xs = strokes.flatMap((s) => s.points.map((p) => p.x))
+      const ys = strokes.flatMap((s) => s.points.map((p) => p.y))
+      const box = { x: Math.min(...xs), y: Math.min(...ys), w: Math.max(...xs) - Math.min(...xs), h: Math.max(...ys) - Math.min(...ys) }
+      return { kind: 'label' as const, box, confidence: 1 }
+    }
+    const { getByTestId, container, getByText } = render(<SketchCanvas recognizer={asLabel} />)
+    const surface = getByTestId('surface')
+    draw(surface, scrawl(100, 100, 120, 16).points)
+    await act(async () => {
+      vi.advanceTimersByTime(MAX_IDLE_MS)
+    })
+    const text = () => container.querySelector('[data-kind="label"]')!.textContent
+    expect(text()).toBe('Label')
+
+    // Not while drawing: only in edit mode.
+    fireEvent.pointerMove(surface, { clientX: 150, clientY: 108 })
+    fireEvent.keyDown(window, { key: '+' })
+    expect(text()).toBe('Label')
+    await act(async () => {
+      fireEvent.keyDown(window, { key: 'e' })
+    })
+    expect(container.querySelector('button[aria-pressed="true"]')?.getAttribute('aria-label')).toBe('Edit')
+
+    // Away from the label, + does nothing and nothing is highlighted.
+    fireEvent.pointerMove(surface, { clientX: 600, clientY: 600 })
+    fireEvent.keyDown(window, { key: '+' })
+    expect(text()).toBe('Label')
+
+    expect(container.querySelector('[data-testid="hover-highlight"]')).toBeNull()
+    await act(async () => {
+      fireEvent.pointerMove(surface, { clientX: 150, clientY: 108 })
+    })
+    expect(container.querySelector('[data-testid="hover-highlight"]')).not.toBeNull()
+    await act(async () => {
+      fireEvent.keyDown(window, { key: '+' })
+    })
+    expect(text()).toBe('Body text')
+    expect(getByText('Body')).not.toBeNull()
+    await act(async () => {
+      fireEvent.keyDown(window, { key: '-' })
+      fireEvent.keyDown(window, { key: '-' })
+    })
+    expect(text()).toBe('Help text')
+
+    // Edit mode doesn't draw.
+    draw(surface, scrawl(400, 300, 100, 16).points)
+    expect(container.querySelectorAll('[data-testid="ink"] path')).toHaveLength(0)
+  })
+
+  it('in edit mode, double-clicking a button edits its text; Escape cancels', async () => {
+    const { getByTestId, container, queryByLabelText, getByLabelText } = render(<SketchCanvas />)
+    const surface = getByTestId('surface')
+    draw(surface, boxStroke(100, 100, 140, 44).points)
+    draw(surface, scrawl(145, 114, 50, 16).points)
+    await act(async () => {
+      vi.advanceTimersByTime(MAX_IDLE_MS)
+    })
+    const button = () => container.querySelector('[data-kind="button"] button')!.textContent
+
+    // Not in draw mode.
+    fireEvent.doubleClick(surface, { clientX: 170, clientY: 122 })
+    expect(queryByLabelText('Edit text')).toBeNull()
+
+    await act(async () => {
+      fireEvent.keyDown(window, { key: 'e' })
+    })
+    fireEvent.doubleClick(surface, { clientX: 170, clientY: 122 })
+    const editor = getByLabelText('Edit text') as HTMLInputElement
+    expect(editor.value).toBe('Button')
+    fireEvent.change(editor, { target: { value: 'Pay now' } })
+    await act(async () => {
+      fireEvent.keyDown(editor, { key: 'Enter' })
+    })
+    expect(queryByLabelText('Edit text')).toBeNull()
+    expect(button()).toBe('Pay now')
+
+    fireEvent.doubleClick(surface, { clientX: 170, clientY: 122 })
+    const again = getByLabelText('Edit text') as HTMLInputElement
+    expect(again.value).toBe('Pay now')
+    fireEvent.change(again, { target: { value: 'Nope' } })
+    await act(async () => {
+      fireEvent.keyDown(again, { key: 'Escape' })
+    })
+    expect(button()).toBe('Pay now')
+
+    await act(async () => {
+      fireEvent.keyDown(window, { key: 'z', metaKey: true })
+    })
+    expect(button()).toBe('Button')
+  })
+
+  it('Tab and Shift+Tab move the text editor through components in reading order', async () => {
+    const { getByTestId, container, getByLabelText, queryByLabelText } = render(<SketchCanvas />)
+    const surface = getByTestId('surface')
+    draw(surface, boxStroke(100, 100, 140, 44).points)
+    draw(surface, scrawl(145, 114, 50, 16).points)
+    await act(async () => {
+      vi.advanceTimersByTime(MAX_IDLE_MS)
+    })
+    draw(surface, boxStroke(400, 400, 260, 40).points)
+    await act(async () => {
+      vi.advanceTimersByTime(MAX_IDLE_MS)
+    })
+    await act(async () => {
+      fireEvent.keyDown(window, { key: 'e' })
+    })
+    fireEvent.doubleClick(surface, { clientX: 170, clientY: 122 })
+    const editor = () => getByLabelText('Edit text') as HTMLInputElement
+    fireEvent.change(editor(), { target: { value: 'Pay now' } })
+    await act(async () => {
+      fireEvent.keyDown(editor(), { key: 'Tab' })
+    })
+    // On to the input's placeholder, the button's text saved.
+    expect(editor().value).toBe('Input')
+    expect(container.querySelector('[data-kind="button"] button')!.textContent).toBe('Pay now')
+    fireEvent.change(editor(), { target: { value: 'Your name' } })
+    await act(async () => {
+      fireEvent.keyDown(editor(), { key: 'Tab', shiftKey: true })
+    })
+    expect(editor().value).toBe('Pay now')
+    expect(container.querySelector('[data-kind="input"] input')!.getAttribute('placeholder')).toBe('Your name')
+    // Past the last one, Tab just saves and closes.
+    await act(async () => {
+      fireEvent.keyDown(editor(), { key: 'Tab' })
+    })
+    await act(async () => {
+      fireEvent.keyDown(editor(), { key: 'Tab' })
+    })
+    expect(queryByLabelText('Edit text')).toBeNull()
+  })
+
+  it('in edit mode, drags a component somewhere else; undo puts it back', async () => {
+    const { getByTestId, container } = render(<SketchCanvas />)
+    const surface = getByTestId('surface')
+    draw(surface, boxStroke(100, 100, 140, 44).points)
+    draw(surface, scrawl(145, 114, 50, 16).points)
+    await act(async () => {
+      vi.advanceTimersByTime(MAX_IDLE_MS)
+    })
+    await act(async () => {
+      fireEvent.keyDown(window, { key: 'e' })
+    })
+    const el = () => container.querySelector('[data-kind="button"]') as HTMLElement
+    const before = el().style.cssText
+    const drag = async (to: { x: number; y: number }) => {
+      await act(async () => {
+        fireEvent.pointerDown(surface, { clientX: 170, clientY: 122, button: 0, pointerId: 1 })
+        fireEvent.pointerMove(surface, { clientX: to.x, clientY: to.y, pointerId: 1 })
+      })
+      return async () =>
+        act(async () => {
+          fireEvent.pointerUp(surface, { pointerId: 1 })
+        })
+    }
+
+    // A jiggle isn't a drag.
+    await (await drag({ x: 172, y: 123 }))()
+    expect(el().style.cssText).toBe(before)
+
+    const drop = await drag({ x: 470, y: 422 })
+    // Follows the pointer while dragging, then lands there.
+    expect(el().style.transform).toBe('translate(300px, 300px)')
+    await drop()
+    expect(el().style.transform).toBe('')
+    expect(parseFloat(el().style.left)).toBeGreaterThan(300)
+    expect(parseFloat(el().style.top)).toBeGreaterThan(300)
+
+    await act(async () => {
+      fireEvent.keyDown(window, { key: 'z', metaKey: true })
+    })
+    expect(el().style.cssText).toBe(before)
+  })
+
+  it('only offers debug mode when asked to', () => {
+    const { queryByLabelText, unmount } = render(<SketchCanvas />)
+    expect(queryByLabelText('Debug')).toBeNull()
+    expect(queryByLabelText('Draw')).not.toBeNull()
+    unmount()
+    expect(render(<SketchCanvas showDebug />).queryByLabelText('Debug')).not.toBeNull()
   })
 
   it('closes the open group when the next stroke starts far away', async () => {
@@ -117,9 +317,13 @@ describe('SketchCanvas', () => {
     const fetchMock = vi.fn(async () => new Response(JSON.stringify({ id: 'fb-1' })))
     vi.stubGlobal('fetch', fetchMock)
     try {
-      const { getByTestId, getByText, container } = render(<SketchCanvas status="Shapes only" />)
+      const { getByTestId, getByText, getByLabelText, container } = render(<SketchCanvas engine="Shapes only" showDebug />)
       const surface = getByTestId('surface')
+      // D draws; debug is only on the toolbar.
+      fireEvent.click(getByLabelText('Debug'))
       fireEvent.keyDown(window, { key: 'd' })
+      expect(container.querySelector('button[aria-pressed="true"]')?.getAttribute('aria-label')).toBe('Draw')
+      fireEvent.click(getByLabelText('Debug'))
       draw(surface, boxStroke(100, 100, 140, 44).points)
       draw(surface, scrawl(145, 114, 50, 16).points)
       await act(async () => {
@@ -149,8 +353,10 @@ describe('SketchCanvas', () => {
       vi.unstubAllGlobals()
     }
   })
-  it('adds a phone frame from the side toolbar', async () => {
-    const { getByLabelText, container } = render(<SketchCanvas />)
+  it('adds a phone frame from the side toolbar (when offered)', async () => {
+    expect(render(<SketchCanvas />).queryByLabelText('Add a phone frame')).toBeNull()
+    cleanup()
+    const { getByLabelText, container } = render(<SketchCanvas showPhone />)
     fireEvent.click(getByLabelText('Add a phone frame'))
     expect(container.querySelector('[data-kind="phone"]')).not.toBeNull()
     await act(async () => {

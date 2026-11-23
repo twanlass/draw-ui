@@ -1,6 +1,7 @@
 import { area, center, containsBox, type Box } from '@/lib/geometry'
 import type { ComponentKind } from '@/recognize/types'
 import { GROUP_INSETS, isFixedSize, isFrame, PHONE_INSETS, type Insets, type PlacedKind } from './frames'
+import { textStyleInfo, type TextStyle } from './textStyles'
 
 /*
  * Auto layout: when a sketch becomes a component, tidy where things land.
@@ -118,12 +119,12 @@ function fixedSize(kind: PlacedKind, drawn: Box): { w: number; h: number } | nul
 }
 
 /** The box the real component occupies, centred where the sketch was. */
-export function naturalBox(kind: PlacedKind, drawn: Box): Box {
+export function naturalBox(kind: PlacedKind, drawn: Box, textStyle?: TextStyle): Box {
   if (isFrame(kind)) return drawn
   const c = center(drawn)
   const size = fixedSize(kind, drawn)
   if (size) return { x: c.x - size.w / 2, y: c.y - size.h / 2, ...size }
-  const h = FIXED_HEIGHT[kind]
+  const h = kind === 'label' ? textStyleInfo(textStyle).height : FIXED_HEIGHT[kind]
   if (h) return { x: drawn.x, y: c.y - h / 2, w: drawn.w, h }
   return drawn
 }
@@ -165,16 +166,69 @@ export interface Item {
   box: Box
   /** Where it was drawn. Layout decisions are made from this, not from where layout last put it. */
   drawnBox?: Box
+  /** For a label: which kind of text, which sets its height. */
+  textStyle?: TextStyle
 }
+
+/** A form label sits closer to the control under it; other text gets the standard gap. */
+const hugsNext = (i: Item | null | undefined) => i?.kind === 'label' && (i.textStyle ?? 'label') === 'label'
 
 /** Only these hold other components; an input that happens to overlap a label doesn't. */
 const canContain = (kind: PlacedKind) => kind === 'card' || isFrame(kind)
 
+/** The tightest card, group or phone under a point, bigger than `minArea`. */
+export function containerAt<T extends Item>(items: T[], p: { x: number; y: number }, minArea = 0): T | undefined {
+  const inside = (b: Box) => p.x >= b.x && p.x <= right(b) && p.y >= b.y && p.y <= bottom(b)
+  return items.filter((o) => canContain(o.kind) && inside(o.box) && area(o.box) > minArea).sort((a, b) => area(a.box) - area(b.box))[0]
+}
+
+/**
+ * A sketch belongs to the container it was started in. Drawn past the
+ * container's edge (a button sketched at the bottom of a card that has
+ * shrunk to its fields), it wouldn't count as inside by its box, so move
+ * the new items into the container's content area, and grow the container
+ * if they're still too big. Layout then gives them their place in it.
+ * `start` is where the sketch's first stroke began.
+ */
+export function settleInto<T extends Item & { drawnBox: Box }>(existing: T[], added: T[], start: { x: number; y: number }): { existing: T[]; added: T[] } {
+  const unchanged = { existing, added }
+  if (!added.length) return unchanged
+  const u = unionOf(added.map((a) => a.box))
+  const host = containerAt(existing, start, area(u))
+  if (!host || added.every((a) => holds(host, a.box))) return unchanged
+
+  const inset = insetsOf(host)
+  const c = { x: host.box.x + inset.left, y: host.box.y + inset.top, w: host.box.w - inset.left - inset.right, h: host.box.h - inset.top - inset.bottom }
+  // Shift the sketch, as one piece, the least that brings it inside (top-left first if it's too big).
+  const shift = (lo: number, size: number, cLo: number, cSize: number) =>
+    lo < cLo || size > cSize ? cLo - lo : lo + size > cLo + cSize ? cLo + cSize - (lo + size) : 0
+  const dx = shift(u.x, u.w, c.x, c.w)
+  const dy = shift(u.y, u.h, c.y, c.h)
+  const fit = (b: Box) => {
+    const moved = { ...b, x: b.x + dx, y: b.y + dy }
+    return moved.w > c.w ? { ...moved, x: c.x, w: c.w } : moved
+  }
+  const settled = added.map((a) => ({ ...a, box: fit(a.box), drawnBox: fit(a.drawnBox) }))
+  const need = Math.max(...settled.map((a) => bottom(a.box))) + inset.bottom - host.box.y
+  if (need <= host.box.h || isFixedSize(host.kind)) return { existing, added: settled }
+  return { existing: existing.map((o) => (o === host ? { ...o, box: { ...o.box, h: need } } : o)), added: settled }
+}
+
 /** The tightest item that contains `b`: its container, if any. */
-function parentOf(b: Item, items: Item[]): Item | undefined {
+export function parentOf<T extends Item>(b: T, items: T[]): T | undefined {
   return items
-    .filter((o) => o !== b && canContain(o.kind) && area(o.box) > area(b.box) && holds(o, b.box))
+    .filter((o) => o !== b && canContain(o.kind) && encloses(o, b) && holds(o, b.box))
     .sort((x, y) => area(x.box) - area(y.box))[0]
+}
+
+/**
+ * Big enough to be `b`'s container. A group hugs its content with no padding,
+ * so a group of one is exactly its member's size; it still holds it.
+ */
+function encloses(o: Item, b: Item): boolean {
+  const a = area(o.box)
+  const ab = area(b.box)
+  return a > ab || (a === ab && o.kind === 'group' && !isFrame(b.kind))
 }
 
 /** Two boxes sit one above the other, overlapping horizontally, close together. */
@@ -280,7 +334,7 @@ export function arrange(items: Item[], id: string): Map<string, Box> {
   // members as drawn) but as tall as it now is, since its height is fitted.
   const asDrawn = (i: Item): Item => {
     const inner = kids(i.id)
-    if (!inner.length) return i.drawnBox ? { ...i, box: naturalBox(i.kind, i.drawnBox) } : i
+    if (!inner.length) return i.drawnBox ? { ...i, box: naturalBox(i.kind, i.drawnBox, i.textStyle) } : i
     if (isFixedSize(i.kind)) return i
     const at = i.kind === 'group' ? unionOf(inner.map((k) => asDrawn(k).box)) : (i.drawnBox ?? i.box)
     return { ...i, box: { x: at.x, y: at.y, w: at.w, h: i.box.h } }
@@ -338,54 +392,109 @@ export function arrange(items: Item[], id: string): Map<string, Box> {
 }
 
 /**
- * Where a container's children go, like a flex column with padding: one
- * column from the top inset, resizable children as wide as the content area,
- * standard gaps. Children that form separate side-by-side stacks (level
- * with each other but not overlapping horizontally, like two form fields
- * next to each other) become a row of equal-width columns instead. Rows
- * (a checkbox and its label) are found first and count as one unit.
+ * Where a container's children go, like nested flex boxes inside its
+ * padding: rows top to bottom with standard gaps, a row split into
+ * equal-width columns where its parts sit side by side, resizable children
+ * as wide as their column (see placeBlock).
  */
 function placeChildren(container: Item, children: Item[]): Map<string, Box> {
   const out = new Map<string, Box>()
   if (!children.length) return out
   const inset = insetsOf(container)
-  const left = container.box.x + inset.left
-  const width = container.box.w - inset.left - inset.right
-  const top = container.box.y + inset.top
+  placeBlock(children, container.box.x + inset.left, container.box.w - inset.left - inset.right, container.box.y + inset.top, out)
+  return out
+}
 
-  // Units share a stack when they overlap horizontally. Level ones that
-  // don't sit side by side. A diagonal pair goes by which gap is bigger:
-  // further below than beside means stacked (an indented label under another).
-  const units = unitsOf(children)
-  const sameStack = (a: Unit, b: Unit) => {
-    const xo = overlap(a.box.x, right(a.box), b.box.x, right(b.box))
-    const yo = overlap(a.box.y, bottom(a.box), b.box.y, bottom(b.box))
-    if (xo > 0) return true
-    if (yo > 0) return false
-    return -yo > -xo
-  }
-  const stacks: Unit[][] = []
-  const seen = new Set<Unit>()
-  for (const u of units) {
-    if (seen.has(u)) continue
-    const stack = cluster(u, units, sameStack)
-    stack.forEach((m) => seen.add(m))
-    stacks.push(stack)
-  }
+/** Overlaps smaller than this are a sloppy edge, not a real overlap. */
+const BAND_SLACK = 4
 
-  if (stacks.length > 1) {
-    stacks.sort((a, b) => Math.min(...a.map((u) => u.box.x)) - Math.min(...b.map((u) => u.box.x)))
-    const w = (width - GAP * (stacks.length - 1)) / stacks.length
-    stacks.forEach((stack, i) => placeColumn(stack, left + i * (w + GAP), w, top, out))
-  } else {
-    placeColumn(units, left, width, top, out)
+/**
+ * Split items into bands along an axis: runs of items whose extents chain
+ * together, with a clean gap (nothing crossing it) between one band and the
+ * next. Along y these are rows, along x columns.
+ */
+function bands(items: Item[], axis: 'x' | 'y'): Item[][] {
+  const start = (i: Item) => (axis === 'x' ? i.box.x : i.box.y)
+  const end = (i: Item) => (axis === 'x' ? right(i.box) : bottom(i.box))
+  const out: Item[][] = []
+  let edge = -Infinity
+  for (const i of [...items].sort((a, b) => start(a) - start(b))) {
+    if (out.length && start(i) < edge - BAND_SLACK) out[out.length - 1].push(i)
+    else out.push([i])
+    edge = out[out.length - 1].length === 1 ? end(i) : Math.max(edge, end(i))
   }
   return out
 }
 
-/** Stack units top to bottom from `top`; single resizable items span `width`. */
-function placeColumn(units: Unit[], left: number, width: number, top: number, out: Map<string, Box>) {
+/**
+ * Rows of a block. Neighbouring rows that share columns are one row: a row
+ * of labels over a row of inputs is a row of label-over-input fields, and a
+ * label drawn a little higher than the field beside it doesn't split off.
+ */
+function rowsOf(items: Item[]): Item[][] {
+  const cols = (group: Item[]) => bands(group, 'x').length
+  const rows: Item[][] = []
+  for (const row of bands(items, 'y')) {
+    const prev = rows[rows.length - 1]
+    if (prev && sideBySide(prev, row, cols)) rows[rows.length - 1] = [...prev, ...row]
+    else rows.push(row)
+  }
+  return rows
+}
+
+/**
+ * Whether two neighbouring rows are really one: they line up into the same
+ * columns, or together they make new columns that sit further apart than the
+ * rows do (a big heading drawn a little lower than the text beside it).
+ * Further below than beside means stacked, like an indented label.
+ */
+function sideBySide(above: Item[], below: Item[], cols: (g: Item[]) => number): boolean {
+  const both = [...above, ...below]
+  const n = cols(both)
+  const most = Math.max(cols(above), cols(below))
+  if (n < 2 || n < most) return false
+  if (n === most) return true
+  const rowGap = Math.min(...below.map((i) => i.box.y)) - Math.max(...above.map((i) => bottom(i.box)))
+  const columns = bands(both, 'x').map((c) => unionOf(c.map((i) => i.box))).sort((a, b) => a.x - b.x)
+  const colGap = Math.min(...columns.slice(1).map((c, i) => c.x - right(columns[i])))
+  return rowGap < colGap
+}
+
+/**
+ * Lay out a block of items within `width` from (`left`, `top`), returning its
+ * bottom. Cut it into rows where nothing crosses between them, and a row into
+ * columns where nothing crosses between those, then do the same inside each,
+ * so full-width fields, a two-column header and a three-column row of fields
+ * can share one card.
+ */
+function placeBlock(items: Item[], left: number, width: number, top: number, out: Map<string, Box>): number {
+  const rows = rowsOf(items)
+  if (rows.length > 1) {
+    let y = top
+    let end = top
+    for (const row of rows) {
+      end = placeBlock(row, left, width, y, out)
+      y = end + (row.length === 1 && hugsNext(row[0]) ? LABEL_GAP : GAP)
+    }
+    return end
+  }
+  const cols = bands(items, 'x').sort((a, b) => Math.min(...a.map((i) => i.box.x)) - Math.min(...b.map((i) => i.box.x)))
+  if (cols.length === 1) return placeColumn(unitsOf(items), left, width, top, out)
+  // Single small things side by side (a checkbox and its label, a label
+  // beside one field) are an inline row at their own sizes, not columns.
+  const stretchy = cols.filter((c) => c.length > 1 || (isResizable(c[0].kind) && c[0].kind !== 'label'))
+  if (stretchy.length <= 1 && cols.every((c) => c.length === 1)) {
+    const members = layoutRow(items)
+    return placeColumn([{ members, box: unionOf(members.map((m) => m.box)) }], left, width, top, out)
+  }
+  const w = (width - GAP * (cols.length - 1)) / cols.length
+  return Math.max(...cols.map((col, i) => placeBlock(col, left + i * (w + GAP), w, top, out)))
+}
+
+/** Stack units top to bottom from `top`; single resizable items span `width`. Returns the bottom. */
+function placeColumn(units: Unit[], left: number, width: number, top: number, out: Map<string, Box>): number {
   let y = top
+  let end = top
   for (const u of [...units].sort((a, b) => a.box.y - b.box.y)) {
     const one = u.members.length === 1 ? u.members[0] : null
     const dx = left - u.box.x
@@ -396,8 +505,10 @@ function placeColumn(units: Unit[], left: number, width: number, top: number, ou
         one ? { x: left, y, w: isResizable(one.kind) ? width : m.box.w, h: m.box.h } : { ...m.box, x: m.box.x + dx, y: m.box.y + dy },
       )
     }
-    y += u.box.h + (one?.kind === 'label' ? LABEL_GAP : GAP)
+    end = y + u.box.h
+    y = end + (hugsNext(one) ? LABEL_GAP : GAP)
   }
+  return end
 }
 
 /** Order items so containers come before (beneath) what they hold. Stable otherwise. */
@@ -463,7 +574,7 @@ function arrangeOne(items: Item[], id: string): Map<string, Box> {
     for (const m of u.members) {
       place(m, one ? { x: left, y, w, h: m.box.h } : { ...m.box, x: m.box.x + dx, y: m.box.y + dy })
     }
-    y += u.box.h + (one?.kind === 'label' ? LABEL_GAP : GAP)
+    y += u.box.h + (hugsNext(one) ? LABEL_GAP : GAP)
   }
   return moved
 }
